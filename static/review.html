@@ -147,18 +147,9 @@
 
     <!-- Charts -->
     <section class="charts-grid">
-      <div class="chart-card">
-        <div class="chart-title">📊 品种盈亏纵览</div>
-        <div class="table-wrap">
-          <table id="pnlOverviewTable">
-            <thead><tr><th>排名</th><th>品种</th><th>手数</th><th>期货盈亏</th><th>手续费</th><th>期权盈亏</th><th>手续费</th><th>总盈亏</th><th>总手续费</th></tr></thead>
-            <tbody id="pnlOverviewBody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="chart-card">
+      <div class="chart-card chart-full">
         <div class="chart-title">📈 每日累计净盈亏趋势</div>
-        <div id="chartTrend" class="chart-container chart-container-tall"></div>
+        <div id="chartTrend" class="chart-container"></div>
       </div>
     </section>
 
@@ -173,6 +164,7 @@
               <th>期货盈亏</th><th>手续费</th>
               <th>期权盈亏</th><th>手续费</th>
               <th>总盈亏</th><th>总手续费</th>
+              <th>胜率</th><th>盈亏比</th>
             </tr>
           </thead>
           <tbody id="symbolTbody"></tbody>
@@ -191,16 +183,38 @@
           </table>
         </div>
       </div>
-      <div class="chart-card">
-        <div class="chart-title">💔 TOP 10 亏损交易</div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>日期</th><th>合约</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>平仓盈亏</th><th>手续费</th></tr></thead>
-            <tbody id="topLossesBody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
+<div class="chart-card">
+<div class="chart-title">💔 TOP 10 亏损交易</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>日期</th><th>合约</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>平仓盈亏</th><th>手续费</th></tr></thead>
+<tbody id="topLossesBody"></tbody>
+</table>
+</div>
+</div>
+</section>
+
+<!-- TOP Options Trades -->
+<section class="charts-grid">
+<div class="chart-card">
+<div class="chart-title">🎯 TOP 10 期权盈利（FIFO匹配后）</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>日期</th><th>期权合约</th><th>标的</th><th>类型</th><th>方向</th><th>执行价</th><th>权金单价</th><th>数量</th><th>平仓盈亏</th></tr></thead>
+<tbody id="topOptWinsBody"></tbody>
+</table>
+</div>
+</div>
+<div class="chart-card">
+<div class="chart-title">⚠️ TOP 10 期权亏损（FIFO匹配后）</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>日期</th><th>期权合约</th><th>标的</th><th>类型</th><th>方向</th><th>执行价</th><th>权金单价</th><th>数量</th><th>平仓盈亏</th></tr></thead>
+<tbody id="topOptLossesBody"></tbody>
+</table>
+</div>
+</div>
+</section>
 
     <!-- Symbol Detail Modal (hidden by default) -->
     <div class="modal-overlay" id="symbolModal" style="display:none;">
@@ -234,7 +248,7 @@
         <div class="tab-content" id="tabOptions" style="display:none;">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>日期</th><th>期权合约</th><th>标的</th><th>类型</th><th>执行价</th><th>方向</th><th>权金单价</th><th>数量</th><th>盈亏(元)</th><th>手续费</th></tr></thead>
+              <thead><tr><th>日期</th><th>期权合约</th><th>标的</th><th>类型</th><th>执行价</th><th>方向</th><th>权金单价</th><th>数量</th><th>平仓盈亏(元)</th><th>手续费</th></tr></thead>
               <tbody id="detailOptsBody"></tbody>
               <tfoot id="detailOptsFoot"></tfoot>
             </table>
@@ -256,6 +270,45 @@
             <table>
               <thead><tr><th>日期</th><th>笔数</th><th>手续费(元)</th></tr></thead>
               <tbody id="detailCommBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Daily Detail Modal (点击趋势图日期时展示) -->
+    <div class="modal-overlay" id="dailyModal" style="display:none;">
+      <div class="modal modal-lg">
+        <div class="modal-header">
+          <h2 id="dailyModalTitle">📅 交割单</h2>
+          <button class="btn btn-outline modal-close" onclick="closeDailyModal()">✕ 关闭</button>
+        </div>
+
+        <!-- 当日汇总 -->
+        <div class="overview-grid modal-stats" id="dailyStats"></div>
+
+        <!-- Tabs: 期货成交 | 期权成交 -->
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="dailyTabFutures">📋 期货成交</button>
+          <button class="tab-btn" data-tab="dailyTabOptions">🎰 期权成交</button>
+        </div>
+
+        <div class="tab-content active" id="dailyTabFutures">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>合约</th><th>品种</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>成交额</th><th>手续费</th><th>平仓盈亏</th></tr></thead>
+              <tbody id="dailyFuturesBody"></tbody>
+              <tfoot id="dailyFuturesFoot"></tfoot>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-content" id="dailyTabOptions" style="display:none;">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>期权合约</th><th>标的</th><th>类型</th><th>方向</th><th>执行价</th><th>权金单价</th><th>数量</th><th>盈亏</th><th>手续费</th></tr></thead>
+              <tbody id="dailyOptionsBody"></tbody>
+              <tfoot id="dailyOptionsFoot"></tfoot>
             </table>
           </div>
         </div>
@@ -291,9 +344,10 @@
           start = fmt(new Date(now.getFullYear(), now.getMonth()-1, 1));
           end = fmt(new Date(now.getFullYear(), now.getMonth(), 0));
         } else if (range === 'all') {
+          const todayStr = fmt(now);
           if (window._fullDateRange) {
             start = window._fullDateRange.start;
-            end = window._fullDateRange.end;
+            end = window._fullDateRange.end > todayStr ? todayStr : window._fullDateRange.end;
           } else {
             const sEl = document.getElementById('startDate');
             const eEl = document.getElementById('endDate');

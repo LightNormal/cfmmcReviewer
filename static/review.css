@@ -282,7 +282,7 @@ tbody tr.clickable:hover { background: rgba(59,130,246,.08); cursor: pointer; }
   height: 320px;
 }
 .chart-container-tall {
-  height: 420px;
+  min-height: 420px;
 }
 
 /* ===== Modal (品种详情) ===== */
@@ -306,6 +306,12 @@ tbody tr.clickable:hover { background: rgba(59,130,246,.08); cursor: pointer; }
   max-width: 1200px;
   box-shadow: 0 25px 80px rgba(0,0,0,.5);
   animation: modalIn .25s ease-out;
+}
+.modal-lg {
+  max-width: 1400px;
+}
+.chart-full {
+  grid-column: 1 / -1;
 }
 @keyframes modalIn {
   from { opacity: 0; transform: translateY(30px) scale(.97); }

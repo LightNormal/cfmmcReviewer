@@ -316,6 +316,20 @@ def api_dates():
     output_dir_exists = os.path.isdir(output_dir)
     has_data = len(dates) > 0
 
+    # 读取配置中的账号信息（用于显示）
+    account_info = None
+    accounts = config.get('accounts', [])
+    if accounts:
+        acc = accounts[0]
+        account_info = {
+            'fund_name': acc.get('fund_name', ''),
+            'account_no': acc.get('account_no', ''),
+            'broker': acc.get('broker', ''),
+        }
+    # 如果已登录，优先使用登录后的信息
+    if _login_status['logged_in'] and _login_status['account_info']:
+        account_info = _login_status['account_info']
+
     return jsonify({
         'date_range': {'start': start, 'end': end},
         'available_dates': dates,
@@ -324,6 +338,7 @@ def api_dates():
         'output_dir_exists': output_dir_exists,
         'has_data': has_data,
         'output_dir': output_dir,
+        'account_info': account_info,
     })
 
 
@@ -395,11 +410,16 @@ def api_query():
             else:
                 print('[API] 未配置账户信息，跳过自动下载')
 
-    # 判断是否需要提示用户登录（有缺失数据但未能自动下载）
+    # 判断是否需要提示用户登录（有缺失数据但未能自动下载，且当前未登录）
+    # 已登录的用户不再弹登录提示，直接用已有数据返回结果
     need_login = False
+    did_auto_download = False
     if missing and auto_dl:
         is_logged_in = _login_status['logged_in'] and _crawler and _crawler.token
         has_config = bool(_load_config().get('accounts'))
+        if is_logged_in:
+            did_auto_download = True  # 已登录，已尝试自动下载
+        # 只有未登录且无配置账户信息时才提示登录
         if not is_logged_in and not has_config:
             need_login = True
 
@@ -419,13 +439,31 @@ def api_query():
         'missing_dates': missing,
         'missing_count': len(missing),
         'need_login': need_login,
+        'did_auto_download': did_auto_download,
     }
+
+    # 期权 TOP 数据：使用权利金现金流法（原始 pnl = premium_total）
+    opt_df = engine.options_df
+    if not opt_df.empty:
+        # 按原始 pnl（权利金现金流）排序
+        opts_sorted = opt_df.sort_values('pnl', ascending=False).reset_index(drop=True)
+        response['opt_top_wins'] = df_to_records(opts_sorted.head(10))
+        response['opt_top_losses'] = df_to_records(opts_sorted.tail(10).iloc[::-1])
+    else:
+        response['opt_top_wins'] = []
+        response['opt_top_losses'] = []
 
     # 处理 datetime 序列化
     for row in response['daily_trend']:
         if 'date' in row and hasattr(row['date'], 'strftime'):
             row['date'] = row['date'].strftime('%Y-%m-%d')
     for row in response['trades_sorted']:
+        if 'date' in row and hasattr(row['date'], 'strftime'):
+            row['date'] = row['date'].strftime('%Y-%m-%d')
+    for row in response.get('opt_top_wins', []):
+        if 'date' in row and hasattr(row['date'], 'strftime'):
+            row['date'] = row['date'].strftime('%Y-%m-%d')
+    for row in response.get('opt_top_losses', []):
         if 'date' in row and hasattr(row['date'], 'strftime'):
             row['date'] = row['date'].strftime('%Y-%m-%d')
 
@@ -475,6 +513,8 @@ def api_symbol_detail(symbol):
     # ---- 1. 期货成交明细 ----
     futures_of_symbol = pd.DataFrame() if engine.trades_df.empty else \
         engine.trades_df[engine.trades_df['symbol'] == symbol].copy()
+
+    # 期权：使用权利金现金流法（原始 pnl = premium_total）
     options_of_symbol = pd.DataFrame() if engine.options_df.empty else \
         engine.options_df[engine.options_df['symbol'] == symbol].copy()
 
@@ -482,6 +522,7 @@ def api_symbol_detail(symbol):
     total_futures_commission = futures_of_symbol['commission'].sum() if not futures_of_symbol.empty else 0
     total_options_commission = options_of_symbol['commission'].sum() if not options_of_symbol.empty else 0
     total_futures_pnl = futures_of_symbol['realized_pnl'].sum() if not futures_of_symbol.empty else 0
+    # 期权盈亏使用权利金现金流（原始 pnl = premium_total）
     total_options_pnl = options_of_symbol['pnl'].sum() if not options_of_symbol.empty else 0
 
     closed_trades = futures_of_symbol[futures_of_symbol['realized_pnl'] != 0] if not futures_of_symbol.empty else pd.DataFrame()
@@ -566,6 +607,90 @@ def api_symbol_detail(symbol):
         'trades': trades_list,
         'options': opts_list,
         'daily_stats': daily_stats,
+    })
+
+
+# ============================================================
+# API: 日期交割单（点击趋势图日期时展示）
+# ============================================================
+
+@app.route('/api/daily/<date_str>', methods=['GET'])
+def api_daily_detail(date_str):
+    """
+    查询某一天的全部成交记录（期货 + 期权），用于点击趋势图日期时弹出交割单。
+    
+    支持格式: YYYY-MM-DD 或 MM-DD（趋势图传的是 MM-DD）
+    """
+    # 趋势图传的 date 是 MM-DD 格式，需要补全年份
+    if len(date_str) == 5 and '-' in date_str:  # MM-DD
+        # 使用当前查询范围的年份（取 start 的年份）
+        start = request.args.get('start', '')
+        if start and len(start) >= 4:
+            year = start[:4]
+            date_str = f'{year}-{date_str}'
+        else:
+            # 回退到今年
+            from datetime import date as _date
+            year = str(_date.today().year)
+            date_str = f'{year}-{date_str}'
+
+    engine = _get_engine()
+    engine.build_dfs()
+
+    def df_to_records(df):
+        if df.empty:
+            return []
+        records = df.to_dict(orient='records')
+        for r in records:
+            if 'date' in r and hasattr(r['date'], 'strftime'):
+                r['date'] = r['date'].strftime('%Y-%m-%d')
+            for k, v in r.items():
+                if isinstance(v, (float,)):
+                    r[k] = round(v, 2)
+        return records
+
+    # 筛选该日期的数据
+    futures_of_day = pd.DataFrame()
+    options_of_day = pd.DataFrame()
+
+    if not engine.trades_df.empty:
+        mask = engine.trades_df['date'].astype(str).str[:10] == date_str
+        futures_of_day = engine.trades_df[mask].copy()
+
+    if not engine.options_df.empty:
+        mask = engine.options_df['date'].astype(str).str[:10] == date_str
+        options_of_day = engine.options_df[mask].copy()
+
+    # ---- 当日汇总统计 ----
+    total_futures_pnl = futures_of_day['realized_pnl'].sum() if not futures_of_day.empty else 0
+    total_futures_comm = futures_of_day['commission'].sum() if not futures_of_day.empty else 0
+    total_opt_pnl = options_of_day['pnl'].sum() if not options_of_day.empty else 0
+    total_opt_comm = options_of_day['commission'].sum() if not options_of_day.empty else 0
+    total_futures_volume = futures_of_day['volume'].sum() if not futures_of_day.empty else 0
+    total_futures_amount = futures_of_day['amount'].sum() if not futures_of_day.empty else 0
+    total_opt_volume = options_of_day['volume'].sum() if not options_of_day.empty else 0
+
+    day_summary = {
+        'date': date_str,
+        '期货笔数': int(len(futures_of_day)),
+        '期权笔数': int(len(options_of_day)),
+        '期货成交量(手)': round(total_futures_volume, 1),
+        '期货成交额(元)': round(total_futures_amount, 2),
+        '期权成交量(手)': round(total_opt_volume, 1),
+        '期货盈亏(元)': round(total_futures_pnl, 2),
+        '期货手续费(元)': round(total_futures_comm, 2),
+        '期货净盈亏(元)': round(total_futures_pnl - total_futures_comm, 2),
+        '期权盈亏(元)': round(total_opt_pnl, 2),
+        '期权手续费(元)': round(total_opt_comm, 2),
+        '当日总盈亏(元)': round(total_futures_pnl + total_opt_pnl, 2),
+        '当日总手续费(元)': round(total_futures_comm + total_opt_comm, 2),
+        '当日净盈亏(元)': round(total_futures_pnl + total_opt_pnl - total_futures_comm - total_opt_comm, 2),
+    }
+
+    return jsonify({
+        'summary': day_summary,
+        'futures_trades': df_to_records(futures_of_day),
+        'options_trades': df_to_records(options_of_day),
     })
 
 

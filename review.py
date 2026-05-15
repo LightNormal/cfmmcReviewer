@@ -40,6 +40,54 @@ CONFIG_FILE = 'config.json'
 
 
 # ============================================================
+# 中国证券市场交易日判断
+# ============================================================
+# 优先使用 chinesecalendar 库（专业维护中国法定节假日及调休安排）
+# pip install chinesecalendar   → 每年更新，含调休上班日
+# 若未安装或超出数据年份范围，回退到仅排除周末
+try:
+    import chinese_calendar  # type: ignore
+    _HAS_CHINESE_CALENDAR = True
+except ImportError:
+    _HAS_CHINESE_CALENDAR = False
+
+
+def is_cn_trading_day(date_str: str) -> bool:
+    """
+    判断某日是否为中国证券市场的交易日（非周末且非法定节假日）。
+
+    优先使用 chinesecalendar 库（自动处理历年节假日及调休上班日）；
+    若未安装或超出其数据年份范围，回退到仅排除周末。
+    """
+    if not date_str:
+        return False
+    try:
+        dt = datetime.strptime(date_str[:10], '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return False
+
+    # 排除周末
+    if dt.weekday() >= 5:
+        return False
+
+    # 优先使用 chinesecalendar（专业中国假期库，含调休上班日）
+    if _HAS_CHINESE_CALENDAR:
+        try:
+            return chinese_calendar.is_workday(dt)
+        except NotImplementedError:
+            # 超出 chinesecalendar 数据年份范围，回退
+            pass
+
+    # 回退：无额外库或超出范围时仅排除周末
+    # 建议安装: pip install chinesecalendar
+    return True
+
+
+# 兼容性提示（首次调用时打印一次）
+_TRADING_DAY_WARNED = False
+
+
+# ============================================================
 # 工具函数
 # ============================================================
 def _to_float(val) -> float:
@@ -225,15 +273,20 @@ class DataLoader:
         return dates[0], dates[-1]
 
     def get_missing_dates(self, start: str, end: str) -> list[str]:
-        """获取指定范围内缺失的交易日（排除周末）"""
+        """获取指定范围内缺失的交易日（排除周末和中国法定节假日）"""
+        global _TRADING_DAY_WARNED
+        if not _HAS_CHINESE_CALENDAR and not _TRADING_DAY_WARNED:
+            print("⚠ 未安装 chinesecalendar，法定节假日判断仅排除周末。"
+                  "建议运行: pip install chinesecalendar")
+            _TRADING_DAY_WARNED = True
+
         missing = []
         current = datetime.strptime(start, '%Y-%m-%d')
         end_dt = datetime.strptime(end, '%Y-%m-%d')
         while current <= end_dt:
-            if current.weekday() < 5:
-                ds = current.strftime('%Y-%m-%d')
-                if ds not in self.cache:
-                    missing.append(ds)
+            ds = current.strftime('%Y-%m-%d')
+            if is_cn_trading_day(ds) and ds not in self.cache:
+                missing.append(ds)
             current += timedelta(days=1)
         return missing
 
@@ -297,6 +350,86 @@ class ReviewEngine:
 
         return self
 
+    # ---- 期权开平仓匹配（FIFO）----
+    def _match_options_pnl(self) -> pd.DataFrame:
+        """
+        使用 FIFO 算法对期权成交记录进行开平仓匹配，计算每笔已实现盈亏。
+
+        匹配规则：
+          - 同一个 opt_contract 下，买方(支出)与卖方(收入)配对
+          - 买方开仓 → 卖方平仓: 盈亏 = (卖价 - 买价) × 手数
+          - 卖方开仓 → 买方平仓: 盈亏 = (卖价 - 买价) × 手数
+        返回带 realized_pnl 列的 options_df 副本。
+        """
+        if self.options_df.empty:
+            return pd.DataFrame()
+
+        df = self.options_df.copy()
+        df['realized_pnl'] = 0.0  # 新增列：每笔成交对应的已实现盈亏
+
+        # 按合约分组，每组内按日期排序做 FIFO 匹配
+        for contract, group in df.groupby('opt_contract'):
+            group = group.sort_values('date').reset_index(drop=True)
+
+            # 两个队列：买方队列（多头持仓）、卖方队列（空头持仓）
+            # 每个元素: {volume: 剩余手数, premium_price: 开仓价格}
+            long_queue = []   # 买方开仓记录（等待卖方平仓）
+            short_queue = []  # 卖方开仓记录（等待买方平仓）
+
+            for idx in group.index:
+                row = df.loc[idx]
+                direction = str(row.get('direction', '')).strip()
+                volume = float(row.get('volume', 0))
+                price = float(row.get('premium_price', 0))
+
+                if direction == '买方':
+                    # 买方 → 如果有卖方队列则匹配平仓，否则加入买方队列（开多）
+                    remaining = volume
+                    pnl_sum = 0.0
+
+                    while remaining > 0 and short_queue:
+                        pos = short_queue[0]
+                        match_vol = min(remaining, pos['volume'])
+                        # 卖方开仓价格 vs 买方平仓价格
+                        pnl_sum += (price - pos['premium_price']) * match_vol
+                        pos['volume'] -= match_vol
+                        remaining -= match_vol
+                        if pos['volume'] <= 0:
+                            short_queue.pop(0)
+
+                    df.at[idx, 'realized_pnl'] = round(pnl_sum, 2)
+
+                    # 剩余部分加入买方队列（新开仓）
+                    if remaining > 0:
+                        long_queue.append({'volume': remaining, 'premium_price': price})
+
+                elif direction == '卖方':
+                    # 卖方 → 如果有买方队列则匹配平仓，否则加入卖方队列（开空）
+                    remaining = volume
+                    pnl_sum = 0.0
+
+                    while remaining > 0 and long_queue:
+                        pos = long_queue[0]
+                        match_vol = min(remaining, pos['volume'])
+                        # 买方开仓价格 vs 卖方平仓价格
+                        pnl_sum += (pos['premium_price'] - price) * match_vol
+                        pos['volume'] -= match_vol
+                        remaining -= match_vol
+                        if pos['volume'] <= 0:
+                            long_queue.pop(0)
+
+                    df.at[idx, 'realized_pnl'] = round(pnl_sum, 2)
+
+                    # 剩余部分加入卖方队列（新开仓）
+                    if remaining > 0:
+                        short_queue.append({'volume': remaining, 'premium_price': price})
+
+        return df
+
+    def get_matched_options_df(self) -> pd.DataFrame:
+        """获取已完成开平仓匹配的期权 DataFrame（含 realized_pnl）"""
+        return self._match_options_pnl()
+
     # ---- 按盈利排序的成交记录 ----
     def get_trades_sorted_by_pnl(self, top_n: int = None, ascending: bool = False) -> pd.DataFrame:
         """获取按平仓盈亏排序的成交记录（默认从高到低）"""
@@ -312,41 +445,50 @@ class ReviewEngine:
         """
         按品种汇总统计。
         
+        期权盈亏使用权利金现金流法（premium_total / 原始 pnl）。
+        同时覆盖：只做期权的品种（无期货成交记录）。
+        
         Returns DataFrame with columns:
-          symbol, trade_count, total_pnl, total_commission,
-          win_count, loss_count, win_rate, avg_win, avg_loss,
-          profit_factor, net_pnl (扣手续费后)
+          品种, 手数, 期货盈亏(元), 期货手续费(元), 期权盈亏(元), 期权手续费(元), 总盈亏(元), 总手续费(元), 胜率, 盈亏比
         """
-        if self.trades_df.empty:
+        # 收集所有品种（期货 ∪ 期权）
+        all_symbols = set()
+        if not self.trades_df.empty:
+            all_symbols.update(self.trades_df['symbol'].unique())
+        if not self.options_df.empty:
+            all_symbols.update(self.options_df['symbol'].unique())
+
+        if not all_symbols:
             return pd.DataFrame()
 
         df = self.trades_df.copy()
         # 只统计有平仓盈亏的记录（开仓为 '--'/0）
-        closed_trades = df[df['realized_pnl'] != 0].copy()
+        closed_trades = df[df['realized_pnl'] != 0].copy() if not df.empty else pd.DataFrame()
 
         results = []
-        for symbol, group in df.groupby('symbol'):
-            closed = closed_trades[closed_trades['symbol'] == symbol]
-            wins = closed[closed['realized_pnl'] > 0]
-            losses = closed[closed['realized_pnl'] < 0]
+        for symbol in sorted(all_symbols):
+            # ---- 期货部分 ----
+            futures_of_symbol = df[df['symbol'] == symbol] if not df.empty else pd.DataFrame()
+            closed = closed_trades[closed_trades['symbol'] == symbol] if not closed_trades.empty else pd.DataFrame()
+            wins = closed[closed['realized_pnl'] > 0] if not closed.empty else pd.DataFrame()
+            losses = closed[closed['realized_pnl'] < 0] if not closed.empty else pd.DataFrame()
 
-            total_pnl = group['realized_pnl'].sum()
-            total_commission = group['commission'].sum()
+            total_pnl = futures_of_symbol['realized_pnl'].sum() if not futures_of_symbol.empty else 0
+            total_commission = futures_of_symbol['commission'].sum() if not futures_of_symbol.empty else 0
             win_count = len(wins)
             loss_count = len(losses)
             total_closed = win_count + loss_count
 
             avg_win = wins['realized_pnl'].mean() if len(wins) > 0 else 0
             avg_loss = abs(losses['realized_pnl'].mean()) if len(losses) > 0 else 0
-            profit_factor = (wins['realized_pnl'].sum() / abs(losses['realized_pnl'].sum())) if losses['realized_pnl'].sum() != 0 else float('inf')
+            profit_factor = (wins['realized_pnl'].sum() / abs(losses['realized_pnl'].sum())) if (not losses.empty and losses['realized_pnl'].sum() != 0) else float('inf')
 
-            # 期权单独列示（不混入期货盈亏）
+            # ---- 期权部分（权利金现金流法）----
             opt_group = self.options_df[self.options_df['symbol'] == symbol] if not self.options_df.empty else pd.DataFrame()
             opt_commission = opt_group['commission'].sum() if not opt_group.empty else 0
             opt_pnl = opt_group['pnl'].sum() if not opt_group.empty else 0
-            opt_count = len(opt_group) if not opt_group.empty else 0
 
-            total_volume = group['volume'].sum()
+            total_volume = futures_of_symbol['volume'].sum() if not futures_of_symbol.empty else 0
             total_pnl_all = total_pnl + opt_pnl
             total_comm_all = total_commission + opt_commission
 
@@ -359,6 +501,9 @@ class ReviewEngine:
                 '期权手续费(元)': round(opt_commission, 2),
                 '总盈亏(元)': round(total_pnl_all, 2),
                 '总手续费(元)': round(total_comm_all, 2),
+                # 期货胜率与盈亏比（仅统计已平仓记录）
+                '胜率': f'{win_count/total_closed*100:.1f}%' if total_closed > 0 else '-',
+                '盈亏比': round(profit_factor, 2) if profit_factor != float('inf') else '∞',
             })
 
         result_df = pd.DataFrame(results)
@@ -368,7 +513,7 @@ class ReviewEngine:
 
     # ---- 每日盈亏趋势（基于逐笔平仓盈亏求和）----
     def get_daily_trend(self) -> pd.DataFrame:
-        """每日累计盈亏趋势，期货平仓盈亏 + 期权权利金按日期求和"""
+        """每日累计盈亏趋势，期货平仓盈亏 + 期权权利金现金流(pnl)按日期求和"""
         if self.trades_df.empty and self.options_df.empty:
             return pd.DataFrame()
         
@@ -382,13 +527,13 @@ class ReviewEngine:
                 daily[d]['futures_pnl'] += row['realized_pnl']
                 daily[d]['futures_comm'] += row['commission']
         
-        # 从期权逐笔数据按日期汇总
+        # 从期权逐笔数据按日期汇总（使用原始 pnl 权利金现金流）
         if not self.options_df.empty:
             for _, row in self.options_df.iterrows():
                 d = str(row['date'])[:10]
                 if d not in daily:
                     daily[d] = {'futures_pnl': 0.0, 'futures_comm': 0.0, 'opt_pnl': 0.0, 'opt_comm': 0.0}
-                daily[d]['opt_pnl'] += row['pnl']
+                daily[d]['opt_pnl'] += row.get('pnl', 0)
                 daily[d]['opt_comm'] += row.get('commission', 0)
         
         rows = []
@@ -422,7 +567,7 @@ class ReviewEngine:
         # 只计算期货逐笔平仓盈亏（不含期权权利金收支）
         futures_pnl = self.trades_df['realized_pnl'].sum() if not self.trades_df.empty else 0
         futures_comm = self.trades_df['commission'].sum() if not self.trades_df.empty else 0
-        # 期权单独统计
+        # 期权：使用权利金现金流法（原始 pnl = premium_total）
         opt_pnl = self.options_df['pnl'].sum() if not self.options_df.empty else 0
         opt_comm = self.options_df['commission'].sum() if not self.options_df.empty else 0
 

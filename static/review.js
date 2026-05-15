@@ -21,6 +21,13 @@ let _isLoggedIn = false;
 // 工具函数
 // ============================================================
 
+/** 获取今天的 YYYY-MM-DD 字符串 */
+function getTodayStr() {
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+}
+
 function fmtNum(n, decimals = 2) {
     if (n === null || n === undefined || n === 'N/A' || n === '∞') return n ?? '-';
     const num = typeof n === 'string' ? parseFloat(n) : n;
@@ -132,6 +139,16 @@ async function checkLoginStatus() {
     }
 }
 
+/** 显示账号信息（未登录但有配置时也能显示） */
+function showAccountInfo(accountInfo) {
+    const loginInfo = document.getElementById('loginInfo');
+    const name = accountInfo.fund_name || accountInfo.account_no || '';
+    if (name) {
+        loginInfo.textContent = `📋 ${name}${accountInfo.broker ? ' (' + accountInfo.broker + ')' : ''}`;
+        loginInfo.style.color = 'var(--text-dimmer)';
+    }
+}
+
 /** 更新登录按钮和信息显示 */
 function updateLoginUI(status) {
     const loginBtn = document.getElementById('loginBtn');
@@ -147,7 +164,10 @@ function updateLoginUI(status) {
     } else {
         loginBtn.style.display = 'inline-flex';
         logoutBtn.style.display = 'none';
-        loginInfo.textContent = '';
+        // 未登录时不清空账号信息（保留 config.json 中读取的账号显示）
+        if (!_isLoggedIn) {
+            // 保持已有的账号信息不变
+        }
         _isLoggedIn = false;
     }
 }
@@ -331,22 +351,32 @@ async function initDates() {
     // 处理日期数据
     if (datesData.status === 'fulfilled') {
         const data = datesData.value;
-        const { date_range, available_dates, logged_in, has_data, output_dir_exists } = data;
+        const { date_range, available_dates, logged_in, has_data, output_dir_exists, account_info } = data;
+
+        // 显示账号信息（无论是否已登录）
+        if (account_info) {
+            showAccountInfo(account_info);
+        }
 
         if (date_range.start && date_range.end) {
             _fullDateRange = { start: date_range.start, end: date_range.end };
             window._fullDateRange = _fullDateRange;
 
+            const today = getTodayStr();
             const sEl = document.getElementById('startDate');
             const eEl = document.getElementById('endDate');
+            // 结束日期不超过今天
             sEl.value = date_range.start;
             sEl.setAttribute('data-full', date_range.start);
-            eEl.value = date_range.end;
-            eEl.setAttribute('data-full', date_range.end);
+            eEl.value = date_range.end > today ? today : date_range.end;
+            eEl.setAttribute('data-full', date_range.end > today ? today : date_range.end);
 
-            setStatus('ready', `已加载 ${available_dates.length} 个交易日 (${date_range.start} ~ ${date_range.end})`);
+            // 限制结束日期 input 的 max 为今天
+            eEl.max = today;
 
-            // 有数据就自动查询
+            setStatus('ready', `已加载 ${available_dates.length} 个交易日 (${date_range.start} ~ ${eEl.value})`);
+
+            // 有存量数据就自动查询（无需登录）
             doQuery();
         } else {
             // 没有本地数据 — 设置默认日期为今天和一个月前
@@ -355,8 +385,10 @@ async function initDates() {
             const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
             const monthAgo = new Date(now.getFullYear(), now.getMonth()-1, now.getDate());
 
+            const todayStr = fmt(now);
             document.getElementById('startDate').value = fmt(monthAgo);
-            document.getElementById('endDate').value = fmt(now);
+            document.getElementById('endDate').value = todayStr;
+            document.getElementById('endDate').max = todayStr;
 
             if (!output_dir_exists) {
                 setStatus('error', `输出目录不存在 (${data.output_dir || '-'})，请先登录下载数据`);
@@ -366,8 +398,8 @@ async function initDates() {
                 setStatus('ready', '暂无本地数据，请选择日期后查询（登录后可自动下载）');
             }
 
-            // 无数据时强制弹出登录框（无论是否已登录，都需要登录来下载数据）
-            if (!_isLoggedIn) {
+            // 无数据时才弹出登录框
+            if (!_isLoggedIn && !has_data) {
                 setTimeout(() => handleLoginClick(), 500);
             }
         }
@@ -422,9 +454,14 @@ async function doQuery() {
 
         // Step 1 完成
         if (data.missing_count > 0) {
-            completeStep(1, `⚠ ${data.missing_count}天缺失`);
+            // 已登录用户：后端已尝试自动下载，残留缺失不再弹登录框
+            if (data.did_auto_download) {
+                completeStep(1, `⬇ 已自动下载，仍缺 ${data.missing_count}天`);
+            } else {
+                completeStep(1, `⚠ ${data.missing_count}天缺失`);
+            }
 
-            // 如果后端提示需要登录才能下载数据
+            // 如果后端提示需要登录才能下载数据（未登录 + 无配置）
             if (data.need_login) {
                 hideProgress();
                 _isQuerying = false;
@@ -492,7 +529,7 @@ function renderAll(data) {
     renderOverview(data.overview);
     renderSymbolTable(data.symbol_summary);
     renderTopTrades(data.trades_sorted);
-    renderPnlOverview(data.symbol_summary);  // 盈亏纵览表格
+    renderTopOptTrades(data.opt_top_wins, data.opt_top_losses);
 }
 
 function renderOverview(ov) {
@@ -530,7 +567,7 @@ function renderOverview(ov) {
 function renderSymbolTable(rows) {
     const tbody = document.getElementById('symbolTbody');
     if (!rows || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty-state"><p>暂无数据</p></td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="empty-state"><p>暂无数据</p></td></tr>';
         return;
     }
 
@@ -541,6 +578,9 @@ function renderSymbolTable(rows) {
         const fpCls = fp > 0 ? 'positive' : fp < 0 ? 'negative' : '';
         const opCls = op > 0 ? 'positive' : op < 0 ? 'negative' : '';
         const tpCls = tp > 0 ? 'positive' : tp < 0 ? 'negative' : '';
+        // 胜率颜色：>=50% 绿色，<50% 红色
+        const wrVal = parseFloat(r['胜率']);
+        const wrCls = !isNaN(wrVal) && wrVal >= 50 ? 'positive' : (!isNaN(wrVal) && wrVal > 0 ? 'negative' : '');
         return `<tr class="clickable" onclick="showSymbolDetail('${r['品种']}')">
             <td><a class="symbol-link">${r['品种']}</a></td>
             <td>${r['手数']}</td>
@@ -550,6 +590,8 @@ function renderSymbolTable(rows) {
             <td>${fmtNum(r['期权手续费(元)'])}</td>
             <td class="${tpCls}">${(tp >= 0 ? '+' : '') + fmtNum(tp)}</td>
             <td>${fmtNum(r['总手续费(元)'])}</td>
+            <td class="${wrCls}">${r['胜率'] || '-'}</td>
+            <td>${r['盈亏比'] || '-'}</td>
         </tr>`;
     }).join('');
 }
@@ -589,6 +631,57 @@ function renderTopTrades(trades) {
             <td>${fmtNum(t.commission)}</td>
         </tr>`;
     }).join('');
+}
+
+// ---- TOP Options Trades（权利金现金流：买方支出/卖方收入）----
+function renderTopOptTrades(optWins, optLosses) {
+    // TOP 10 期权盈利
+    const winsBody = document.getElementById('topOptWinsBody');
+    if (!optWins || optWins.length === 0) {
+        winsBody.innerHTML = '<tr><td colspan="9" class="empty-state"><p>暂无数据</p></td></tr>';
+    } else {
+        winsBody.innerHTML = optWins.map(o => {
+            // 使用 pnl（权利金现金流），兼容 realized_pnl（旧数据）
+            const pnl = o.pnl !== undefined ? o.pnl : (o.realized_pnl || 0);
+            const pnlCls = pnl > 0 ? 'positive' : '';
+            const pnlText = (pnl >= 0 ? '+' : '') + fmtNum(pnl);
+            return `<tr>
+                <td>${shortDate(o.date)}</td>
+                <td style="font-weight:600">${o.opt_contract}</td>
+                <td>${o.underlying}</td>
+                <td>${o.opt_type}</td>
+                <td>${o.direction}</td>
+                <td>${fmtNum(o.strike)}</td>
+                <td>${fmtNum(o.premium_price)}</td>
+                <td>${o.volume}</td>
+                <td class="${pnlCls}" style="font-weight:600">${pnlText}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    // TOP 10 期权亏损
+    const lossesBody = document.getElementById('topOptLossesBody');
+    if (!optLosses || optLosses.length === 0) {
+        lossesBody.innerHTML = '<tr><td colspan="9" class="empty-state"><p>暂无数据</p></td></tr>';
+    } else {
+        lossesBody.innerHTML = optLosses.map(o => {
+            // 使用 pnl（权利金现金流），兼容 realized_pnl（旧数据）
+            const pnl = o.pnl !== undefined ? o.pnl : (o.realized_pnl || 0);
+            const pnlCls = pnl < 0 ? 'negative' : '';
+            const pnlText = (pnl >= 0 ? '+' : '') + fmtNum(pnl);
+            return `<tr>
+                <td>${shortDate(o.date)}</td>
+                <td style="font-weight:600">${o.opt_contract}</td>
+                <td>${o.underlying}</td>
+                <td>${o.opt_type}</td>
+                <td>${o.direction}</td>
+                <td>${fmtNum(o.strike)}</td>
+                <td>${fmtNum(o.premium_price)}</td>
+                <td>${o.volume}</td>
+                <td class="${pnlCls}" style="font-weight:600">${pnlText}</td>
+            </tr>`;
+        }).join('');
+    }
 }
 
 // ---- 盈亏纵览表格（替代原来的柱状图）----
@@ -636,6 +729,8 @@ function renderPnlOverview(rows) {
             <td>${fmtNum(r['期权手续费(元)'])}</td>
             <td class="${tpCls}" style="font-weight:600">${(tp >= 0 ? '+' : '') + fmtNum(tp)}</td>
             <td>${fmtNum(r['总手续费(元)'])}</td>
+            <td>${r['胜率'] || '-'}</td>
+            <td>${r['盈亏比'] || '-'}</td>
         </tr>`;
     }).join('');
 
@@ -672,7 +767,7 @@ async function loadCharts(start, end) {
     }
 }
 
-// ---- 每日趋势图（纵向：柱子横排，日期在Y轴）----
+// ---- 每日趋势图（横向：X轴日期，Y轴金额）----
 function renderTrendChart(trendData) {
     const dom = document.getElementById('chartTrend');
     if (!dom || !trendData || !trendData.length) return;
@@ -684,52 +779,91 @@ function renderTrendChart(trendData) {
         dailyPnl.slice(0, i + 1).reduce((a, b) => a + b, 0)
     );
 
+    // 固定高度（标准图表高度）
+    dom.style.height = '420px';
+    chart.resize();
+
     chart.setOption({
         tooltip: {
             trigger: 'axis',
             axisPointer: { type: 'cross' },
-            textStyle: { color: '#fff' }
+            backgroundColor: 'rgba(30, 41, 59, 0.95)',
+            borderColor: 'rgba(255,255,255,0.15)',
+            borderWidth: 1,
+            borderRadius: 6,
+            padding: [8, 12],
+            textStyle: { color: '#e2e8f0', fontSize: 13 },
         },
         legend: {
             data: ['每日净盈亏', '累计净盈亏'],
             top: 0,
-            textStyle: { color: '#fff' }
+            itemWidth: 20,
+            itemHeight: 12,
+            itemGap: 24,
+            textStyle: { color: '#fff', fontSize: 13, fontWeight: '500' },
+            selectedMode: true,
+            backgroundColor: 'rgba(255,255,255,0.06)',
+            borderColor: 'rgba(255,255,255,0.12)',
+            borderWidth: 1,
+            borderRadius: 6,
+            padding: [8, 16],
         },
-        grid: { left: 70, right: 70, top: 40, bottom: 20 },
+        grid: { left: 60, right: 60, top: 55, bottom: 80 },
         xAxis: {
+            type: 'category',
+            data: dates,
+            axisLabel: {
+                fontSize: 11, color: '#aaa',
+                rotate: dates.length > 20 ? 35 : (dates.length > 10 ? 25 : 0),
+                formatter: v => v.substring(5), // 只显示 MM-DD
+            },
+            axisLine: { lineStyle: { color: '#555' } },
+            axisTick: { alignWithLabel: true },
+        },
+        yAxis: {
             type: 'value',
-            axisLabel: { formatter: v => (v / 10000).toFixed(1) + 'w', color: '#fff' },
+            axisLabel: {
+                fontSize: 11, color: '#aaa',
+                formatter: v => (v / 10000).toFixed(1) + 'w',
+            },
             axisLine: { lineStyle: { color: '#555' } },
             splitLine: { lineStyle: { color: '#333' } }
         },
-        yAxis: {
-            type: 'category',
-            data: dates.slice().reverse(),
-            axisLabel: { fontSize: 11, color: '#fff' },
-            axisLine: { lineStyle: { color: '#555' } },
-        },
+        dataZoom: dates.length > 15 ? [
+            {
+                type: 'inside',
+                start: Math.max(0, 100 - (15 / dates.length * 100)),
+                end: 100,
+            },
+            ] : [],
         series: [
             {
                 name: '每日净盈亏',
                 type: 'bar',
-                data: dailyPnl.slice().reverse().map(v => ({
+                data: dailyPnl.map(v => ({
                     value: v,
                     itemStyle: { color: v >= 0 ? '#e74c3c' : '#27ae60' }
                 })),
-                barWidth: '60%'
+                barMaxWidth: 30,
             },
             {
                 name: '累计净盈亏',
                 type: 'line',
-                data: cumulative.slice().reverse(),
+                data: cumulative,
                 smooth: true,
                 lineStyle: { color: '#3b82f6', width: 2.5 },
                 itemStyle: { color: '#3b82f6' },
-                areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 1, y2: 0,
-                    colorStops: [{ offset: 0, color: 'rgba(59,130,246,0)' }, { offset: 1, color: 'rgba(59,130,246,0.15)' }]
+                areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+                    colorStops: [{ offset: 0, color: 'rgba(59,130,246,0.25)' }, { offset: 1, color: 'rgba(59,130,246,0)' }]
                 }}
             }
         ]
+    });
+    // 点击日期柱子 → 弹出该日交割单
+    chart.on('click', function (params) {
+        if (params.value !== undefined && params.name) {
+            showDailyDetail(params.name);
+        }
     });
     window.addEventListener('resize', () => chart.resize());
 }
@@ -854,7 +988,7 @@ function renderDetailTrades(trades) {
     </tr>`;
 }
 
-// ---- 期权明细 ----
+// ---- 期权明细（FIFO 匹配后平仓盈亏）----
 function renderDetailOptions(options) {
     const tbody = document.getElementById('detailOptsBody');
     const tfoot = document.getElementById('detailOptsFoot');
@@ -865,12 +999,13 @@ function renderDetailOptions(options) {
         return;
     }
 
-    // 统计盈亏
+    // 统计盈亏（使用 pnl: 权利金现金流）
     let totalPnl = 0, totalCommission = 0, totalPremium = 0;
     let winCount = 0, lossCount = 0, winPnl = 0, lossPnl = 0;
 
     tbody.innerHTML = options.map(o => {
-        const pnl = o.pnl || 0;
+            // 使用 pnl（权利金现金流），兼容 realized_pnl（旧数据）
+            const pnl = o.pnl !== undefined ? o.pnl : (o.realized_pnl || 0);
         totalPnl += pnl;
         totalCommission += (o.commission || 0);
         totalPremium += (o.premium_total || 0);
@@ -971,6 +1106,149 @@ function switchTab(tabId) {
 document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
+
+// ============================================================
+// 日期交割单（点击趋势图日期时展示）
+// ============================================================
+
+/** 打开某日期的交割单 */
+async function showDailyDetail(dateStr) {
+    const start = document.getElementById('startDate').value;
+    document.getElementById('dailyModal').style.display = 'flex';
+    document.getElementById('dailyModalTitle').textContent = `📅 交割单 - ${dateStr}`;
+
+    // 显示骨架屏
+    document.getElementById('dailyStats').innerHTML = '<div class="skeleton" style="min-height:100px;grid-column:1/-1;"></div>';
+    ['dailyFuturesBody', 'dailyOptionsBody', 'dailyFuturesFoot', 'dailyOptionsFoot'].forEach(id => {
+        document.getElementById(id).innerHTML = '<tr><td colspan="9" class="empty-state"><p>加载中...</p></td></tr>';
+    });
+
+    try {
+        let url = `/api/daily/${encodeURIComponent(dateStr)}`;
+        if (start) url += `?start=${start}`;
+        const data = await apiGet(url);
+
+        renderDailyStats(data.summary);
+        renderDailyFutures(data.futures_trades);
+        renderDailyOptions(data.options_trades);
+        switchTab('dailyTabFutures');
+    } catch (e) {
+        document.getElementById('dailyStats').innerHTML =
+            `<div class="empty-state" style="grid-column:1/-1;"><p>加载失败: ${e.message}</p></div>`;
+    }
+}
+
+function closeDailyModal() { document.getElementById('dailyModal').style.display = 'none'; }
+
+document.addEventListener('click', e => { if (e.target.id === 'dailyModal') closeDailyModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDailyModal(); });
+
+/** 渲染当日汇总统计卡片 */
+function renderDailyStats(summary) {
+    const fields = [
+        ['期货笔数', summary['期货笔数']], ['期权笔数', summary['期权笔数']],
+        ['期货成交量(手)', summary['期货成交量(手)']],
+        ['期货盈亏(元)', summary['期货盈亏(元)']], ['期货手续费(元)', summary['期货手续费(元)']],
+        ['期货净盈亏(元)', summary['期货净盈亏(元)']],
+        ['期权盈亏(元)', summary['期权盈亏(元)']], ['期权手续费(元)', summary['期权手续费(元)']],
+        ['当日总盈亏(元)', summary['当日总盈亏(元)']],
+        ['当日总手续费(元)', summary['当日总手续费(元)']],
+        ['当日净盈亏(元)', summary['当日净盈亏(元)']],
+    ];
+
+    document.getElementById('dailyStats').innerHTML = fields.map(([label, val]) => {
+        const colored = ['期货盈亏(元)', '期货净盈亏(元)', '期权盈亏(元)',
+                        '当日总盈亏(元)', '当日净盈亏(元)'].includes(label);
+        const c = fmtColored(val);
+        return `<div class="card"><div class="card-label">${label}</div><div class="card-value ${colored ? c.cls : ''}">${c.text}</div></div>`;
+    }).join('');
+}
+
+/** 渲染当日期货成交明细 */
+function renderDailyFutures(trades) {
+    const tbody = document.getElementById('dailyFuturesBody');
+    const tfoot = document.getElementById('dailyFuturesFoot');
+
+    if (!trades || trades.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><p>该日无期货成交记录</p></td></tr>';
+        tfoot.innerHTML = '';
+        return;
+    }
+
+    let totalPnl = 0, totalComm = 0, totalAmount = 0, totalVolume = 0;
+
+    tbody.innerHTML = trades.map(t => {
+        const pnl = t.realized_pnl || 0;
+        totalPnl += pnl;
+        totalComm += (t.commission || 0);
+        totalAmount += (t.amount || 0);
+        totalVolume += (t.volume || 0);
+
+        const pnlCls = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
+        const pnlText = (pnl >= 0 ? '+' : '') + fmtNum(pnl);
+        return `<tr>
+            <td style="font-weight:600">${t.contract}</td>
+            <td><a class="symbol-link" onclick="showSymbolDetail('${t.symbol}');closeDailyModal();">${t.symbol}</a></td>
+            <td>${t.direction}</td>
+            <td>${t.open_close}</td>
+            <td>${fmtNum(t.price)}</td>
+            <td>${t.volume}</td>
+            <td>${fmtNum(t.amount)}</td>
+            <td>${fmtNum(t.commission)}</td>
+            <td class="${pnlCls}" style="font-weight:600">${pnlText}</td>
+        </tr>`;
+    }).join('');
+
+    const netPnlCls = totalPnl >= 0 ? 'positive' : 'negative';
+    tfoot.innerHTML = `<tr class="summary-row">
+        <td colspan="5" style="text-align:right;font-weight:700;">合计 (${trades.length} 笔)</td>
+        <td>${totalVolume}</td>
+        <td>${fmtNum(totalAmount)}</td>
+        <td>${fmtNum(totalComm)}</td>
+        <td class="${netPnlCls}" style="font-weight:700;">${(totalPnl >= 0 ? '+' : '') + fmtNum(totalPnl)}</td>
+    </tr>`;
+}
+
+/** 渲染当日期权成交明细 */
+function renderDailyOptions(options) {
+    const tbody = document.getElementById('dailyOptionsBody');
+    const tfoot = document.getElementById('dailyOptionsFoot');
+
+    if (!options || options.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><p>该日期权成交记录</p></td></tr>';
+        tfoot.innerHTML = '';
+        return;
+    }
+
+    let totalPnl = 0, totalComm = 0;
+
+    tbody.innerHTML = options.map(o => {
+        const pnl = o.pnl !== undefined ? o.pnl : (o.realized_pnl || 0);
+        totalPnl += pnl;
+        totalComm += (o.commission || 0);
+
+        const pnlCls = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
+        const pnlText = (pnl >= 0 ? '+' : '') + fmtNum(pnl);
+        return `<tr>
+            <td style="font-weight:600">${o.opt_contract}</td>
+            <td>${o.underlying}</td>
+            <td>${o.opt_type}</td>
+            <td>${o.direction}</td>
+            <td>${fmtNum(o.strike)}</td>
+            <td>${fmtNum(o.premium_price)}</td>
+            <td>${o.volume}</td>
+            <td class="${pnlCls}" style="font-weight:600">${pnlText}</td>
+            <td>${fmtNum(o.commission)}</td>
+        </tr>`;
+    }).join('');
+
+    const netPnlCls = totalPnl >= 0 ? 'positive' : 'negative';
+    tfoot.innerHTML = `<tr class="summary-row">
+        <td colspan="7" style="text-align:right;font-weight:700;">合计 (${options.length} 笔)</td>
+        <td class="${netPnlCls}" style="font-weight:700;">${(totalPnl >= 0 ? '+' : '') + fmtNum(totalPnl)}</td>
+        <td>${fmtNum(totalComm)}</td>
+    </tr>`;
+}
 
 // ============================================================
 // 启动
