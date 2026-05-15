@@ -226,7 +226,7 @@ def parse_trade_xls(filepath: str) -> dict:
                 'premium_price': _to_float(ws.cell_value(r, min(5, ws.ncols - 1))),
                 'volume': _to_float(ws.cell_value(r, min(6, ws.ncols - 1))),
                 'premium_total': premium_total,
-                'commission': _to_float(ws.cell_value(r, min(10, ws.ncols - 1))),
+                'commission': _to_float(ws.cell_value(r, min(9, ws.ncols - 1))),
                 # premium_total 已含符号: 买方(负=支出), 卖方(正=收入)
                 'pnl': premium_total,
                 'date': result['date'],

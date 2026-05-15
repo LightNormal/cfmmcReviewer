@@ -859,11 +859,54 @@ function renderTrendChart(trendData) {
             }
         ]
     });
-    // 点击日期柱子 → 弹出该日交割单
+
+    // 点击柱状图 → 弹出该日交割单
+    // 策略: ECharts click 对正值柱子可靠，对负值柱子不可靠
+    // 所以用 chart.dispatchEvent 模拟 + 坐标反查双重保障
+    let clickHandled = false;
+
+    // 方案1: ECharts 原生 click（对绿色/正值柱子有效）
     chart.on('click', function (params) {
-        if (params.value !== undefined && params.name) {
+        if (params.seriesType === 'bar' && params.value !== undefined && params.name) {
+            clickHandled = true;
             showDailyDetail(params.name);
         }
+    });
+
+    // 方案2: canvas DOM mousedown → 用 ECharts 内部 API 查找点击位置的 dataIndex
+    // 这是最底层的方式，不依赖 ECharts 的事件热区判定
+    dom.addEventListener('mousedown', function (e) {
+        clickHandled = false;
+    });
+    dom.addEventListener('mouseup', function (e) {
+        // 如果 ECharts click 已经处理了就跳过（防止重复触发）
+        if (clickHandled) return;
+
+        // 用 getBoundingClientRect 获取点击在 canvas 中的相对坐标
+        const rect = dom.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        // convertFromPixel 对 category 轴返回 NaN，改用纯数学计算
+        // grid 配置: left=60, right=60 (像素)，图表绘图区域宽度 = canvas宽 - 120
+        const gridLeft = 60;   // 与 option.grid.left 一致
+        const gridRight = 60;  // 与 option.grid.right 一致
+        const plotWidth = rect.width - gridLeft - gridRight;
+
+        // 点击位置在绘图区域内的相对 X 坐标
+        const relX = x - gridLeft;
+
+        // 如果点在绘图区域左侧或右侧，忽略
+        if (relX < 0 || relX > plotWidth) return;
+
+        // 根据相对位置计算日期索引（均匀分布）
+        const ratio = relX / plotWidth;
+        let dataIndex = Math.floor(ratio * dates.length);
+        if (dataIndex < 0) dataIndex = 0;
+        if (dataIndex >= dates.length) dataIndex = dates.length - 1;
+
+        console.log('[canvas click] x:', x, 'relX:', relX, 'ratio:', ratio, 'idx:', dataIndex, 'date:', dates[dataIndex]);
+        showDailyDetail(dates[dataIndex]);
     });
     window.addEventListener('resize', () => chart.resize());
 }

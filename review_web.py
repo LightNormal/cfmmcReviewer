@@ -534,7 +534,7 @@ def api_symbol_detail(symbol):
     total_closed = win_count + loss_count
     avg_win = wins['realized_pnl'].mean() if len(wins) > 0 else 0
     avg_loss = abs(losses['realized_pnl'].mean()) if len(losses) > 0 else 0
-    pf = (wins['realized_pnl'].sum() / abs(losses['realized_pnl'].sum())) if losses['realized_pnl'].sum() != 0 else float('inf')
+    pf = (wins['realized_pnl'].sum() / abs(losses['realized_pnl'].sum())) if (len(losses) > 0 and losses['realized_pnl'].sum() != 0) else float('inf')
     max_win = futures_of_symbol['realized_pnl'].max() if not futures_of_symbol.empty else 0
     max_loss = futures_of_symbol['realized_pnl'].min() if not futures_of_symbol.empty else 0
     total_volume = futures_of_symbol['volume'].sum() if not futures_of_symbol.empty else 0
@@ -625,6 +625,7 @@ def api_daily_detail(date_str):
     if len(date_str) == 5 and '-' in date_str:  # MM-DD
         # 使用当前查询范围的年份（取 start 的年份）
         start = request.args.get('start', '')
+        end = request.args.get('end', '')
         if start and len(start) >= 4:
             year = start[:4]
             date_str = f'{year}-{date_str}'
@@ -636,6 +637,33 @@ def api_daily_detail(date_str):
 
     engine = _get_engine()
     engine.build_dfs()
+
+    # 如果 MM-DD 格式补全后找不到数据，尝试用下一年（跨年场景）
+    # 例如查询范围 2025-12 ~ 2026-05，趋势图点击 05-12 实际是 2026-05-12
+    has_data = False
+    if not engine.trades_df.empty:
+        mask = engine.trades_df['date'].astype(str).str[:10] == date_str
+        has_data = mask.any()
+    if not has_data and not engine.options_df.empty:
+        mask = engine.options_df['date'].astype(str).str[:10] == date_str
+        has_data = mask.any()
+
+    if not has_data and len(date_str) == 10:
+        # 尝试 +1 年
+        parts = date_str.split('-')
+        try:
+            alt_date = f'{int(parts[0]) + 1}-{parts[1]}-{parts[2]}'
+            # 检查替代日期是否有数据
+            if not engine.trades_df.empty:
+                mask = engine.trades_df['date'].astype(str).str[:10] == alt_date
+                if mask.any():
+                    date_str = alt_date
+            if not engine.options_df.empty:
+                mask = engine.options_df['date'].astype(str).str[:10] == alt_date
+                if mask.any():
+                    date_str = alt_date
+        except (ValueError, IndexError):
+            pass
 
     def df_to_records(df):
         if df.empty:
