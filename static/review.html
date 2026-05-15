@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>📊 期货交易复盘系统</title>
+  <link rel="stylesheet" href="/static/review.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+
+  <!-- ===== Header ===== -->
+  <header class="header">
+    <div class="header-left">
+      <h1>📊 期货交易<span>复盘系统</span></h1>
+      <span class="badge">v3.0</span>
+    </div>
+    <div class="header-right">
+      <span id="dataStatus" class="status-dot loading"></span>
+      <span id="statusText" class="status-text">正在加载数据...</span>
+      <button id="loginBtn" class="btn btn-outline btn-sm" onclick="handleLoginClick()" style="display:none;">🔐 登录</button>
+      <button id="logoutBtn" class="btn btn-outline btn-sm" onclick="doLogout()" style="display:none;">🚪 登出</button>
+      <span id="loginInfo" class="login-info"></span>
+    </div>
+  </header>
+
+  <!-- ===== Toolbar ===== -->
+  <div class="toolbar">
+    <div class="date-input-group">
+      <label>开始日期</label>
+      <input type="date" id="startDate" />
+    </div>
+
+    <div class="date-input-group">
+      <label>结束日期</label>
+      <input type="date" id="endDate" />
+    </div>
+
+    <!-- 快捷日期选择 -->
+    <div class="quick-dates">
+      <button class="btn btn-quick" data-range="today">今日</button>
+      <button class="btn btn-quick" data-range="week">本周</button>
+      <button class="btn btn-quick" data-range="month">本月</button>
+      <button class="btn btn-quick" data-range="lastMonth">上月</button>
+      <button class="btn btn-quick" data-range="all">全部</button>
+    </div>
+
+    <button class="btn btn-primary" id="queryBtn" onclick="doQuery()">
+      🔍 查询复盘
+    </button>
+
+    <span id="queryInfo" class="status-text"></span>
+  </div>
+
+  <!-- ===== Login Modal (未登录时显示) ===== -->
+  <div class="modal-overlay" id="loginModal" style="display:none;">
+    <div class="modal login-modal">
+      <div class="modal-header">
+        <h2>🔐 用户登录</h2>
+        <button class="btn btn-outline modal-close" onclick="closeLoginModal()">✕</button>
+      </div>
+      <div class="login-body">
+        <p class="login-desc">登录监控中心后可自动下载缺失的结算单数据</p>
+
+        <!-- 账号 -->
+        <div class="form-group">
+          <label class="veri-label">账号</label>
+          <input type="text" id="loginAccountNo" class="form-input" placeholder="请输入期货账号" autocomplete="username" />
+        </div>
+
+        <!-- 密码 -->
+        <div class="form-group">
+          <label class="veri-label">密码</label>
+          <input type="password" id="loginPassword" class="form-input" placeholder="请输入查询密码" autocomplete="current-password" />
+        </div>
+
+        <!-- 验证码区域 -->
+        <div class="vericode-section">
+          <label class="veri-label">验证码</label>
+          <div class="veri-input-row">
+            <input type="text" id="vericodeInput" class="veri-input" placeholder="请输入验证码" maxlength="6" autocomplete="off" disabled />
+            <div id="vericodePlaceholder" class="veri-placeholder" onclick="fetchVericode()" title="点击获取验证码">
+              <span class="veri-placeholder-icon">📷</span>
+              <span class="veri-placeholder-text">点击获取验证码</span>
+            </div>
+            <img id="vericodeImg" class="veri-img" src="" alt="验证码" onclick="refreshVericode()" style="display:none;" title="点击图片刷新验证码" />
+            <button id="refreshVeriBtn" class="btn btn-outline btn-sm" onclick="refreshVericode()" title="换一张验证码" style="display:none;">🔄 刷新</button>
+          </div>
+          <p id="loginError" class="login-error"></p>
+        </div>
+
+        <div class="login-actions">
+          <button class="btn btn-primary" id="loginSubmitBtn" onclick="submitLogin()" style="display:none;">确认登录</button>
+        </div>
+        <p class="login-hint">💡 提示：请先填写账号和密码，然后点击「获取验证码」；也可留空使用 config.json 中配置的账户</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Progress Overlay (查询进度) ===== -->
+  <div class="progress-overlay" id="progressOverlay" style="display:none;">
+    <div class="progress-box">
+      <div class="progress-spinner"></div>
+      <h3 id="progressTitle">正在处理...</h3>
+      <p id="progressDesc" class="progress-desc">准备中</p>
+      <div class="progress-steps">
+        <div class="step" id="step1">
+          <div class="step-icon">📥</div>
+          <div class="step-label">检查/下载数据</div>
+          <div class="step-status" id="step1Status"></div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step2">
+          <div class="step-icon">📊</div>
+          <div class="step-label">分析数据</div>
+          <div class="step-status" id="step2Status"></div>
+        </div>
+        <div class="step-arrow">→</div>
+        <div class="step" id="step3">
+          <div class="step-icon">✅</div>
+          <div class="step-label">完成</div>
+          <div class="step-status" id="step3Status"></div>
+        </div>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progressBar" style="width:0%"></div>
+      </div>
+      <p id="progressDetail" class="progress-detail"></p>
+    </div>
+  </div>
+
+  <!-- ===== Main Content ===== -->
+  <main class="main">
+
+    <!-- Overview Cards -->
+    <section class="overview-grid" id="overviewGrid">
+      <div class="card"><div class="card-label">交易日数</div><div class="card-value" id="ovDays">-</div></div>
+      <div class="card"><div class="card-label">期货笔数</div><div class="card-value" id="ovFuturesTrades">-</div></div>
+      <div class="card"><div class="card-label">期权笔数</div><div class="card-value" id="ovOptTrades">-</div></div>
+      <div class="card"><div class="card-label">品种数</div><div class="card-value" id="ovSymbols">-</div></div>
+      <div class="card card-highlight"><div class="card-label">总盈亏</div><div class="card-value" id="ovTotalPnl">-</div></div>
+      <div class="card"><div class="card-label">期货盈亏</div><div class="card-value" id="ovPnl">-</div></div>
+      <div class="card"><div class="card-label">期权盈亏</div><div class="card-value" id="ovOptPnl">-</div></div>
+      <div class="card"><div class="card-label">总手续费</div><div class="card-value" id="ovCommission">-</div></div>
+      <div class="card card-highlight"><div class="card-label">净盈亏</div><div class="card-value" id="ovNetPnl">-</div></div>
+    </section>
+
+    <!-- Charts -->
+    <section class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-title">📊 品种盈亏纵览</div>
+        <div class="table-wrap">
+          <table id="pnlOverviewTable">
+            <thead><tr><th>排名</th><th>品种</th><th>手数</th><th>期货盈亏</th><th>手续费</th><th>期权盈亏</th><th>手续费</th><th>总盈亏</th><th>总手续费</th></tr></thead>
+            <tbody id="pnlOverviewBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">📈 每日累计净盈亏趋势</div>
+        <div id="chartTrend" class="chart-container chart-container-tall"></div>
+      </div>
+    </section>
+
+    <!-- Symbol Summary Table -->
+    <section class="section">
+      <div class="section-title">品种汇总（点击品种查看详情）</div>
+      <div class="table-wrap">
+        <table id="symbolTable">
+          <thead>
+            <tr>
+              <th>品种</th><th>手数</th>
+              <th>期货盈亏</th><th>手续费</th>
+              <th>期权盈亏</th><th>手续费</th>
+              <th>总盈亏</th><th>总手续费</th>
+            </tr>
+          </thead>
+          <tbody id="symbolTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- TOP Trades -->
+    <section class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-title">🏆 TOP 10 盈利交易</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>日期</th><th>合约</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>平仓盈亏</th><th>手续费</th></tr></thead>
+            <tbody id="topWinsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">💔 TOP 10 亏损交易</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>日期</th><th>合约</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>平仓盈亏</th><th>手续费</th></tr></thead>
+            <tbody id="topLossesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Symbol Detail Modal (hidden by default) -->
+    <div class="modal-overlay" id="symbolModal" style="display:none;">
+      <div class="modal">
+        <div class="modal-header">
+          <h2 id="modalTitle">品种详情 - </h2>
+          <button class="btn btn-outline modal-close" onclick="closeModal()">✕ 关闭</button>
+        </div>
+
+        <!-- Stats Cards -->
+        <div class="overview-grid modal-stats" id="modalStats"></div>
+
+        <!-- Tabs: 成交明细 | 期权 | 每日汇总 | 手续费 -->
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="tabTrades">📋 成交明细</button>
+          <button class="tab-btn" data-tab="tabOptions">🎰 期权成交</button>
+          <button class="tab-btn" data-tab="tabDaily">📅 每日汇总</button>
+          <button class="tab-btn" data-tab="tabCommission">💰 手续费统计</button>
+        </div>
+
+        <div class="tab-content active" id="tabTrades">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>日期</th><th>合约</th><th>方向</th><th>开平</th><th>价格</th><th>手数</th><th>成交额</th><th>手续费</th><th>平仓盈亏</th></tr></thead>
+              <tbody id="detailTradesBody"></tbody>
+              <tfoot id="detailTradesFoot"></tfoot>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-content" id="tabOptions" style="display:none;">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>日期</th><th>期权合约</th><th>标的</th><th>类型</th><th>执行价</th><th>方向</th><th>权金单价</th><th>数量</th><th>盈亏(元)</th><th>手续费</th></tr></thead>
+              <tbody id="detailOptsBody"></tbody>
+              <tfoot id="detailOptsFoot"></tfoot>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-content" id="tabDaily" style="display:none;">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>日期</th><th>笔数</th><th>盈亏(元)</th><th>手续费(元)</th><th>净盈亏(元)</th></tr></thead>
+              <tbody id="detailDailyBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-content" id="tabCommission" style="display:none;">
+          <div class="commission-summary" id="commissionSummary"></div>
+          <div class="table-wrap" style="margin-top:16px;">
+            <table>
+              <thead><tr><th>日期</th><th>笔数</th><th>手续费(元)</th></tr></thead>
+              <tbody id="detailCommBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <script src="/static/review.js"></script>
+  <script>
+    // 快捷日期按钮绑定
+    document.querySelectorAll('.btn-quick').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const range = btn.dataset.range;
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+
+        let start, end;
+
+        if (range === 'today') {
+          start = end = fmt(now);
+        } else if (range === 'week') {
+          const day = now.getDay() || 7;
+          const monday = new Date(now);
+          monday.setDate(now.getDate() - day + 1);
+          start = fmt(monday);
+          end = fmt(now);
+        } else if (range === 'month') {
+          start = fmt(new Date(now.getFullYear(), now.getMonth(), 1));
+          end = fmt(now);
+        } else if (range === 'lastMonth') {
+          start = fmt(new Date(now.getFullYear(), now.getMonth()-1, 1));
+          end = fmt(new Date(now.getFullYear(), now.getMonth(), 0));
+        } else if (range === 'all') {
+          if (window._fullDateRange) {
+            start = window._fullDateRange.start;
+            end = window._fullDateRange.end;
+          } else {
+            const sEl = document.getElementById('startDate');
+            const eEl = document.getElementById('endDate');
+            start = sEl.getAttribute('data-full') || sEl.value;
+            end = eEl.getAttribute('data-full') || eEl.value;
+          }
+        }
+
+        if (start && end) {
+          document.getElementById('startDate').value = start;
+          document.getElementById('endDate').value = end;
+          document.querySelectorAll('.btn-quick').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        }
+      });
+    });
+
+    // 登录表单快捷键
+    document.getElementById('loginAccountNo').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); document.getElementById('loginPassword').focus(); }
+    });
+    document.getElementById('loginPassword').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); fetchVericode(); }
+    });
+    document.getElementById('vericodeInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') submitLogin();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+
+# 敏感信息 - 账户配置（包含密码）
+config.json
+
+# 下载的真实交易数据
+output/
+
+# 图表输出
+review_charts/*.png
+review_charts/*.jpg
+
+# 调试/临时文件
+debug_*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
