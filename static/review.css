@@ -97,6 +97,12 @@ body {
 }
 .toolbar input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-bg); }
 
+/* 日期选择器日历按钮颜色 */
+.toolbar input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  cursor: pointer;
+}
+
 /* Quick Date Buttons */
 .quick-dates {
   display: flex;
@@ -110,7 +116,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: transparent;
-  color: var(--text-dim);
+  color: #fff;
   font-size: 12px;
   cursor: pointer;
   font-weight: 500;

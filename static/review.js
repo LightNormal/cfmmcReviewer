@@ -905,7 +905,6 @@ function renderTrendChart(trendData) {
         if (dataIndex < 0) dataIndex = 0;
         if (dataIndex >= dates.length) dataIndex = dates.length - 1;
 
-        console.log('[canvas click] x:', x, 'relX:', relX, 'ratio:', ratio, 'idx:', dataIndex, 'date:', dates[dataIndex]);
         showDailyDetail(dates[dataIndex]);
     });
     window.addEventListener('resize', () => chart.resize());
