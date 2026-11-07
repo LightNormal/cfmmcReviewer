@@ -160,7 +160,8 @@ body {
 .btn-outline:hover { border-color: var(--blue); color: var(--blue); }
 
 /* ===== Main ===== */
-.main { padding: 24px 32px; max-width: 1600px; margin: 0 auto; }
+/* 流式布局：内容跟随浏览器窗口宽度伸缩，不再固定 1600px 上限 */
+.main { padding: 24px 32px; width: 100%; margin: 0 auto; }
 
 /* ===== Overview Cards ===== */
 .overview-grid {
@@ -214,7 +215,17 @@ body {
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--card);
+  min-width: 0;
+  /* 保留横向滚动条占位，窄窗口下能明显看到并拖动 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  overscroll-behavior-x: contain;
 }
+/* WebKit 可见横向滚动条 */
+.table-wrap::-webkit-scrollbar { height: 10px; }
+.table-wrap::-webkit-scrollbar-track { background: var(--bg); border-radius: 5px; }
+.table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+.table-wrap::-webkit-scrollbar-thumb:hover { background: var(--text-dimmer); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead { background: rgba(59,130,246,.06); }
 th {
@@ -271,6 +282,8 @@ tbody tr.clickable:hover { background: rgba(59,130,246,.08); cursor: pointer; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 20px;
+  /* 允许随窗口收缩，宽内容交给内部横向滚动 */
+  min-width: 0;
 }
 .chart-title {
   font-size: 14px;

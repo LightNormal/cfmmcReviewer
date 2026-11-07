@@ -36,6 +36,40 @@ from flask_cors import CORS
 
 from review import DataLoader, ReviewEngine, ReviewVisualizer, auto_download_missing
 
+import math
+
+
+def _num(v, default=0.0):
+    """转成 JSON 安全的数值（NaN/Inf → default）"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return round(f, 2)
+
+
+def df_to_records(df):
+    """DataFrame → dict list，并把 NaN/Inf 清洗为 0/None。
+
+    pandas 的 NaN 会被 json 序列化成非法字面量 `NaN`，
+    前端 JSON.parse 直接抛异常，导致整页无法渲染（长周期复盘尤其常见，
+    因为缺口日更多、更容易出现空值列）。
+    """
+    if df is None or df.empty:
+        return []
+    records = json.loads(df.to_json(orient='records', date_format='iso'))
+    for r in records:
+        for k, v in list(r.items()):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                r[k] = 0.0
+            # datetime 统一为 YYYY-MM-DD
+            if isinstance(v, str) and len(v) >= 19 and v[4] == '-' and v[13:19] in ('00:00:00',):
+                r[k] = v[:10]
+    return records
+
+
 # 延迟导入 cfMMC crawler（避免未安装依赖时启动失败）
 _cfmmc_crawler_module = None
 def _get_cfmmc():
@@ -425,12 +459,6 @@ def api_query():
 
     result = engine.query_by_date_range(start, end)
 
-    # DataFrame → dict list（JSON 序列化）
-    def df_to_records(df):
-        if df.empty:
-            return []
-        return df.to_dict(orient='records')
-
     response = {
         'overview': result['overview'],
         'symbol_summary': df_to_records(result['symbol_summary']),
@@ -442,30 +470,21 @@ def api_query():
         'did_auto_download': did_auto_download,
     }
 
-    # 期权 TOP 数据：使用权利金现金流法（原始 pnl = premium_total）
-    opt_df = engine.options_df
-    if not opt_df.empty:
-        # 按原始 pnl（权利金现金流）排序
-        opts_sorted = opt_df.sort_values('pnl', ascending=False).reset_index(drop=True)
-        response['opt_top_wins'] = df_to_records(opts_sorted.head(10))
-        response['opt_top_losses'] = df_to_records(opts_sorted.tail(10).iloc[::-1])
+    # 期权 TOP 数据：使用 FIFO 匹配后的已实现盈亏（附带权利金现金流参考列 pnl）
+    opt_matched = engine.get_matched_options_df()
+    if not opt_matched.empty:
+        matched_sorted = opt_matched.sort_values('realized_pnl', ascending=False).reset_index(drop=True)
+        # 平仓盈亏为 0 的记录不参与 TOP（纯开仓/纯持仓）
+        closed_only = matched_sorted[matched_sorted['realized_pnl'] != 0]
+        response['opt_top_wins'] = df_to_records(closed_only.head(10))
+        tail = closed_only.tail(10).iloc[::-1]
+        response['opt_top_losses'] = df_to_records(tail)
+        # 期末未平仓合约（已实现盈亏不含浮动部分，供前端提示）
+        response['opt_open_positions'] = getattr(engine, 'option_open_positions', {})
     else:
         response['opt_top_wins'] = []
         response['opt_top_losses'] = []
-
-    # 处理 datetime 序列化
-    for row in response['daily_trend']:
-        if 'date' in row and hasattr(row['date'], 'strftime'):
-            row['date'] = row['date'].strftime('%Y-%m-%d')
-    for row in response['trades_sorted']:
-        if 'date' in row and hasattr(row['date'], 'strftime'):
-            row['date'] = row['date'].strftime('%Y-%m-%d')
-    for row in response.get('opt_top_wins', []):
-        if 'date' in row and hasattr(row['date'], 'strftime'):
-            row['date'] = row['date'].strftime('%Y-%m-%d')
-    for row in response.get('opt_top_losses', []):
-        if 'date' in row and hasattr(row['date'], 'strftime'):
-            row['date'] = row['date'].strftime('%Y-%m-%d')
+        response['opt_open_positions'] = {}
 
     return jsonify(response)
 
@@ -514,29 +533,41 @@ def api_symbol_detail(symbol):
     futures_of_symbol = pd.DataFrame() if engine.trades_df.empty else \
         engine.trades_df[engine.trades_df['symbol'] == symbol].copy()
 
-    # 期权：使用权利金现金流法（原始 pnl = premium_total）
-    options_of_symbol = pd.DataFrame() if engine.options_df.empty else \
-        engine.options_df[engine.options_df['symbol'] == symbol].copy()
+    # 期权：使用 FIFO 匹配后的已实现盈亏（基于全历史配对，记在平仓笔上）
+    opt_matched = engine.get_matched_options_df()
+    options_of_symbol = pd.DataFrame() if opt_matched.empty else \
+        opt_matched[opt_matched['symbol'] == symbol].copy()
 
     # ---- 2. 基础统计 ----
     total_futures_commission = futures_of_symbol['commission'].sum() if not futures_of_symbol.empty else 0
     total_options_commission = options_of_symbol['commission'].sum() if not options_of_symbol.empty else 0
     total_futures_pnl = futures_of_symbol['realized_pnl'].sum() if not futures_of_symbol.empty else 0
-    # 期权盈亏使用权利金现金流（原始 pnl = premium_total）
-    total_options_pnl = options_of_symbol['pnl'].sum() if not options_of_symbol.empty else 0
+    # 期权盈亏 = FIFO 已实现盈亏；权利金收支单列为参考
+    total_options_pnl = options_of_symbol['realized_pnl'].sum() if not options_of_symbol.empty else 0
+    total_options_cashflow = options_of_symbol['pnl'].sum() if not options_of_symbol.empty else 0
+
+    # 期权平仓统计（按笔的已实现盈亏）
+    opt_closed = options_of_symbol[options_of_symbol['realized_pnl'] != 0] if not options_of_symbol.empty else pd.DataFrame()
+    opt_wins = opt_closed[opt_closed['realized_pnl'] > 0] if not opt_closed.empty else pd.DataFrame()
+    opt_losses = opt_closed[opt_closed['realized_pnl'] < 0] if not opt_closed.empty else pd.DataFrame()
 
     closed_trades = futures_of_symbol[futures_of_symbol['realized_pnl'] != 0] if not futures_of_symbol.empty else pd.DataFrame()
     wins = closed_trades[closed_trades['realized_pnl'] > 0] if not closed_trades.empty else pd.DataFrame()
     losses = closed_trades[closed_trades['realized_pnl'] < 0] if not closed_trades.empty else pd.DataFrame()
 
-    win_count = len(wins)
-    loss_count = len(losses)
+    win_count = len(wins) + len(opt_wins)
+    loss_count = len(losses) + len(opt_losses)
     total_closed = win_count + loss_count
-    avg_win = wins['realized_pnl'].mean() if len(wins) > 0 else 0
-    avg_loss = abs(losses['realized_pnl'].mean()) if len(losses) > 0 else 0
-    pf = (wins['realized_pnl'].sum() / abs(losses['realized_pnl'].sum())) if (len(losses) > 0 and losses['realized_pnl'].sum() != 0) else float('inf')
-    max_win = futures_of_symbol['realized_pnl'].max() if not futures_of_symbol.empty else 0
-    max_loss = futures_of_symbol['realized_pnl'].min() if not futures_of_symbol.empty else 0
+    avg_win = (pd.concat([wins, opt_wins])['realized_pnl'].mean()) if win_count > 0 else 0
+    avg_loss = abs(pd.concat([losses, opt_losses])['realized_pnl'].mean()) if loss_count > 0 else 0
+    gross_win = (wins['realized_pnl'].sum() if not wins.empty else 0) + (opt_wins['realized_pnl'].sum() if not opt_wins.empty else 0)
+    gross_loss = (losses['realized_pnl'].sum() if not losses.empty else 0) + (opt_losses['realized_pnl'].sum() if not opt_losses.empty else 0)
+    pf = (gross_win / abs(gross_loss)) if gross_loss != 0 else float('inf')
+    all_pnl_series = pd.concat([
+        futures_of_symbol['realized_pnl'] if not futures_of_symbol.empty else pd.Series(dtype=float),
+        options_of_symbol['realized_pnl'] if not options_of_symbol.empty else pd.Series(dtype=float)])
+    max_win = all_pnl_series.max() if len(all_pnl_series) else 0
+    max_loss = all_pnl_series.min() if len(all_pnl_series) else 0
     total_volume = futures_of_symbol['volume'].sum() if not futures_of_symbol.empty else 0
     total_amount = futures_of_symbol['amount'].sum() if not futures_of_symbol.empty else 0
 
@@ -547,11 +578,13 @@ def api_symbol_detail(symbol):
         '平仓笔数': int(total_closed),
         '总成交量(手)': round(total_volume, 1),
         '总成交额(元)': round(total_amount, 2),
-        # 只算期货逐笔平仓盈亏
+        # 期货逐笔平仓盈亏 + 期权FIFO已实现盈亏
         '期货盈亏(元)': round(total_futures_pnl, 2),
         '期货净盈亏(元)': round(total_futures_pnl - total_futures_commission, 2),
-        # 期权单独列示
         '期权盈亏(元)': round(total_options_pnl, 2),
+        '期权权利金收支(元)': round(total_options_cashflow, 2),
+        '总盈亏(元)': round(total_futures_pnl + total_options_pnl, 2),
+        '净盈亏(元)': round(total_futures_pnl + total_options_pnl - total_futures_commission - total_options_commission, 2),
         '期货手续费(元)': round(total_futures_commission, 2),
         '期权手续费(元)': round(total_options_commission, 2),
         '胜率': f'{win_count/total_closed*100:.1f}%' if total_closed > 0 else 'N/A',
@@ -565,40 +598,38 @@ def api_symbol_detail(symbol):
     }
 
     # ---- 3. 期货成交明细（按日期倒序）----
-    trades_list = []
-    if not futures_of_symbol.empty:
-        for _, row in futures_of_symbol.sort_values('date', ascending=False).iterrows():
-            d = row.to_dict()
-            if hasattr(d.get('date'), 'strftime'):
-                d['date'] = d['date'].strftime('%Y-%m-%d')
-            for k, v in d.items():
-                if isinstance(v, (float,)):
-                    d[k] = round(v, 2)
-            trades_list.append(d)
+    trades_list = df_to_records(
+        futures_of_symbol.sort_values('date', ascending=False)) if not futures_of_symbol.empty else []
 
-    # ---- 4. 期权成交明细 ----
-    opts_list = []
-    if not options_of_symbol.empty:
-        for _, row in options_of_symbol.sort_values('date', ascending=False).iterrows():
-            d = row.to_dict()
-            if hasattr(d.get('date'), 'strftime'):
-                d['date'] = d['date'].strftime('%Y-%m-%d')
-            for k, v in d.items():
-                if isinstance(v, (float,)):
-                    d[k] = round(v, 2)
-            opts_list.append(d)
+    # ---- 4. 期权成交明细（含 FIFO 已实现盈亏列 realized_pnl）----
+    opts_list = df_to_records(
+        options_of_symbol.sort_values('date', ascending=False)) if not options_of_symbol.empty else []
 
-    # ---- 5. 每日盈亏 & 手续费汇总 ----
+    # ---- 5. 每日盈亏 & 手续费汇总（期货 + 期权合并）----
     daily_stats = []
-    if not futures_of_symbol.empty:
-        for date_str, group in futures_of_symbol.groupby(futures_of_symbol['date'].dt.date if hasattr(futures_of_symbol['date'].iloc[0], 'date') else 'date'):
-            ds = str(date_str)
+    if not futures_of_symbol.empty or not options_of_symbol.empty:
+        merged_rows = {}
+        if not futures_of_symbol.empty:
+            for _, row in futures_of_symbol.iterrows():
+                ds = str(row['date'])[:10]
+                item = merged_rows.setdefault(ds, {'count': 0, 'pnl': 0.0, 'comm': 0.0})
+                item['count'] += 1
+                item['pnl'] += float(row.get('realized_pnl') or 0)
+                item['comm'] += float(row.get('commission') or 0)
+        if not options_of_symbol.empty:
+            for _, row in options_of_symbol.iterrows():
+                ds = str(row['date'])[:10]
+                item = merged_rows.setdefault(ds, {'count': 0, 'pnl': 0.0, 'comm': 0.0})
+                item['count'] += 1
+                item['pnl'] += float(row.get('realized_pnl') or 0)
+                item['comm'] += float(row.get('commission') or 0)
+        for ds, item in merged_rows.items():
             daily_stats.append({
                 'date': ds,
-                '笔数': len(group),
-                '盈亏(元)': round(group['realized_pnl'].sum(), 2),
-                '手续费(元)': round(group['commission'].sum(), 2),
-                '净盈亏(元)': round(group['realized_pnl'].sum() - group['commission'].sum(), 2),
+                '笔数': item['count'],
+                '盈亏(元)': round(item['pnl'], 2),
+                '手续费(元)': round(item['comm'], 2),
+                '净盈亏(元)': round(item['pnl'] - item['comm'], 2),
             })
         daily_stats.sort(key=lambda x: x['date'], reverse=True)
 
@@ -665,19 +696,7 @@ def api_daily_detail(date_str):
         except (ValueError, IndexError):
             pass
 
-    def df_to_records(df):
-        if df.empty:
-            return []
-        records = df.to_dict(orient='records')
-        for r in records:
-            if 'date' in r and hasattr(r['date'], 'strftime'):
-                r['date'] = r['date'].strftime('%Y-%m-%d')
-            for k, v in r.items():
-                if isinstance(v, (float,)):
-                    r[k] = round(v, 2)
-        return records
-
-    # 筛选该日期的数据
+    # 筛选该日期的数据（期权用全历史 FIFO 匹配后的结果，保证跨窗口平仓也能显示盈亏）
     futures_of_day = pd.DataFrame()
     options_of_day = pd.DataFrame()
 
@@ -685,14 +704,15 @@ def api_daily_detail(date_str):
         mask = engine.trades_df['date'].astype(str).str[:10] == date_str
         futures_of_day = engine.trades_df[mask].copy()
 
-    if not engine.options_df.empty:
-        mask = engine.options_df['date'].astype(str).str[:10] == date_str
-        options_of_day = engine.options_df[mask].copy()
+    opt_matched = engine.get_matched_options_df()
+    if not opt_matched.empty:
+        mask = opt_matched['date'].astype(str).str[:10] == date_str
+        options_of_day = opt_matched[mask].copy()
 
     # ---- 当日汇总统计 ----
     total_futures_pnl = futures_of_day['realized_pnl'].sum() if not futures_of_day.empty else 0
     total_futures_comm = futures_of_day['commission'].sum() if not futures_of_day.empty else 0
-    total_opt_pnl = options_of_day['pnl'].sum() if not options_of_day.empty else 0
+    total_opt_pnl = options_of_day['realized_pnl'].sum() if not options_of_day.empty else 0
     total_opt_comm = options_of_day['commission'].sum() if not options_of_day.empty else 0
     total_futures_volume = futures_of_day['volume'].sum() if not futures_of_day.empty else 0
     total_futures_amount = futures_of_day['amount'].sum() if not futures_of_day.empty else 0
@@ -806,27 +826,24 @@ def api_chart_data():
 
     result = {}
 
-    # 每日趋势数据
+    # 每日趋势数据（完整日期，跨年长周期也不会重复）
     if not trend_df.empty:
-        trend_records = trend_df.to_dict(orient='records')
+        trend_records = df_to_records(trend_df)
         for r in trend_records:
-            if 'date' in r and hasattr(r['date'], 'strftime'):
-                r['date'] = r['date'].strftime('%m-%d')
-            for k, v in r.items():
-                if isinstance(v, (float,)):
-                    r[k] = round(v, 2)
+            if 'date' in r and isinstance(r['date'], str) and len(r['date']) >= 10:
+                r['date'] = r['date'][:10]
         result['daily_trend'] = trend_records
 
     # 饼图数据：品种盈亏分布（排除0值）
     if not symbol_df.empty:
         pie_df = symbol_df[symbol_df['总盈亏(元)'] != 0].copy()
         if not pie_df.empty:
-            result['pie'] = [{'name': row['品种'], 'value': round(row['总盈亏(元)'], 2)}
+            result['pie'] = [{'name': row['品种'], 'value': _num(row['总盈亏(元)'])}
                              for _, row in pie_df.iterrows()]
 
         # 排名数据：品种盈亏排名
-        result['ranking'] = [{'name': row['品种'], 'value': round(row['总盈亏(元)'], 2)}
-                            for _, row in symbol_df.iterrows()]
+        result['ranking'] = [{'name': row['品种'], 'value': _num(row['总盈亏(元)'])}
+                             for _, row in symbol_df.iterrows()]
 
     return jsonify(result)
 
