@@ -159,7 +159,9 @@ def _parse_result(resp_text: str, user_id: str) -> dict:
     return {
         'userId': user_id,
         'currentEquity': get_current_equity(resp_text),
-        'currentDate': get_tradedate_equity(resp_text)[1:11],
+        # get_tradedate_equity() 已去掉外层引号，返回 'YYYY-MM-DD'。
+        # 原来的 [1:11] 会切掉首字符得到 '026-04-30'。
+        'currentDate': get_tradedate_equity(resp_text)[:10],
         'riskRate': get_risk_rate(resp_text),
         'todayIncome': get_today_income(resp_text),
         'earnestMoney': get_earnest_money(resp_text),
@@ -227,7 +229,7 @@ def do_date(user_id: str, passwd: str, trade_date: str) -> dict | None:
 
     # 解析结构化数据
     current_equity = get_current_equity(resp_text)
-    current_date = get_tradedate_equity(resp_text)[1:11]
+    current_date = get_tradedate_equity(resp_text)[:10]
 
     print(f'  账户:{user_id}  客户权益:{current_equity}  交易日期:{current_date}')
 
@@ -472,16 +474,26 @@ def _save_as_excel(results: list[dict], filepath: str) -> None:
 # 入口
 # ============================================================
 if __name__ == '__main__':
-    # ========== 单日查询示例 ==========
-    # result = do(account, password)
-    # print(result)
+    # 原实现直接引用未定义的 `account` / `password`，一运行就 NameError。
+    # 这里改为从 config.json 读取（缺失时给出明确提示）。
+    import json
+    import os
 
-    # ========== 批量查询示例 ==========
+    _cfg_path = 'config.json'
+    if not os.path.exists(_cfg_path):
+        raise SystemExit('未找到 config.json，请先配置账户信息')
+    with open(_cfg_path, 'r', encoding='utf-8') as _f:
+        _cfg = json.load(_f)
+
+    _accounts = _cfg.get('accounts') or []
+    if not _accounts:
+        raise SystemExit('config.json 中没有 accounts 配置')
+    _acc = _accounts[0]
 
     do_batch(
-        user_id=account,
-        passwd=password,
-        start_date='2026-04-01',
-        end_date='2026-05-10',
+        user_id=_acc['account_no'],
+        passwd=_acc['password'],
+        start_date=_cfg.get('start_date', '2026-04-01'),
+        end_date=_cfg.get('end_date', '2026-05-10'),
         # output_file='my_data.json',   # 可选，默认自动生成文件名
     )

@@ -12,6 +12,11 @@ config.json
 # 下载的真实交易数据
 output/
 
+# 品种筛选：行情缓存与自选列表（本地生成，不应提交）
+cache/
+watchlist.json
+watchlist.json.tmp
+
 # 图表输出
 review_charts/*.png
 review_charts/*.jpg
@@ -31,3 +36,15 @@ Thumbs.db
 
 # 日志
 *.log
+
+# cfmmc.py（v1 爬虫）在工作目录生成的原始数据与导出结果（含账户号与权益）
+raw_*/
+cfmmc_*.json
+
+# 配置备份
+config.json.bak
+
+
+# 回测明细（可随时重新生成）
+backtest_detail*.csv
+

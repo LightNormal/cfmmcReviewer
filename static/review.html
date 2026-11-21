@@ -5,6 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>📊 期货交易复盘系统</title>
   <link rel="stylesheet" href="/static/review.css">
+  <script>
+    // 在首屏绘制前应用已保存的主题，避免"先暗后亮"的闪烁
+    (function () {
+      try {
+        if (localStorage.getItem('cfmmc-theme') === 'light') {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      } catch (e) { /* 隐私模式忽略 */ }
+    })();
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -13,9 +23,17 @@
   <header class="header">
     <div class="header-left">
       <h1>📊 期货交易<span>复盘系统</span></h1>
-      <span class="badge">v3.0</span>
+      <span class="badge">v3.1</span>
     </div>
+    <nav class="view-nav" id="viewNav">
+      <button class="view-btn active" data-view="review">📊 复盘</button>
+      <button class="view-btn" data-view="screener">🔍 品种筛选</button>
+    </nav>
     <div class="header-right">
+      <button id="themeBtn" class="btn btn-outline btn-sm theme-btn" type="button"
+              onclick="toggleTheme()" title="切换亮色/暗色主题">
+        <span id="themeIcon">🌙</span><span id="themeLabel">暗色</span>
+      </button>
       <span id="dataStatus" class="status-dot loading"></span>
       <span id="statusText" class="status-text">正在加载数据...</span>
       <button id="loginBtn" class="btn btn-outline btn-sm" onclick="handleLoginClick()" style="display:none;">🔐 登录</button>
@@ -25,7 +43,7 @@
   </header>
 
   <!-- ===== Toolbar ===== -->
-  <div class="toolbar">
+  <div class="toolbar" id="dateToolbar">
     <div class="date-input-group">
       <label>开始日期</label>
       <input type="date" id="startDate" />
@@ -47,6 +65,11 @@
 
     <button class="btn btn-primary" id="queryBtn" onclick="doQuery()">
       🔍 查询复盘
+    </button>
+
+    <button class="btn btn-outline" id="reloadBtn" onclick="reloadData()"
+            title="重新读取磁盘上的结算单。下载新数据后点这个即可，不用重启服务">
+      🔄 重载数据
     </button>
 
     <span id="queryInfo" class="status-text"></span>
@@ -132,6 +155,25 @@
   <!-- ===== Main Content ===== -->
   <main class="main">
 
+    <!-- ===== View: 复盘 ===== -->
+    <div id="viewReview">
+
+    <!-- 数据质量提示（期权乘数存疑 / 期末未平仓） -->
+    <div class="warn-banner" id="dataWarnings" style="display:none;"></div>
+
+    <!-- 数据缺口诊断（区分真缺口 / 区间外 / 节假日） -->
+    <div class="gap-panel" id="gapPanel" style="display:none;">
+      <div class="gap-head">
+        <span class="gap-title">🗓 数据缺口诊断</span>
+        <div class="gap-actions">
+          <button class="btn btn-primary btn-sm" id="gapDownloadBtn" type="button" style="display:none;">登录补下载</button>
+          <button class="btn btn-outline btn-sm" id="gapToggleBtn" type="button">展开全部日期</button>
+          <button class="btn btn-outline btn-sm" id="gapCloseBtn" type="button">隐藏</button>
+        </div>
+      </div>
+      <div class="gap-body" id="gapBody"></div>
+    </div>
+
     <!-- Overview Cards -->
     <section class="overview-grid" id="overviewGrid">
       <div class="card"><div class="card-label">交易日数</div><div class="card-value" id="ovDays">-</div></div>
@@ -150,6 +192,18 @@
       <div class="chart-card chart-full">
         <div class="chart-title">📈 每日累计净盈亏趋势</div>
         <div id="chartTrend" class="chart-container"></div>
+      </div>
+
+      <div class="chart-card chart-full">
+        <div class="chart-title">
+          💰 账户权益走势
+          <span id="equityStats" class="chart-sub"></span>
+        </div>
+        <div id="chartEquity" class="chart-container"></div>
+        <div class="chart-hint">
+          数据取自结算单「资金状况」区。注意：逐笔对冲报表的客户权益是<b>现金口径</b>——
+          买入期权会减少现金，但持仓市值不计入权益，所以权益下降不等于亏损（卖出期权开仓则相反）。
+        </div>
       </div>
     </section>
 
@@ -215,6 +269,125 @@
 </div>
 </div>
 </section>
+
+    </div><!-- /#viewReview -->
+
+    <!-- ===== View: 品种筛选 ===== -->
+    <div id="viewScreener" style="display:none;">
+
+      <!-- 筛选条件 -->
+      <div class="scr-filters" id="scrFilters">
+        <div class="scr-field">
+          <label for="scrProximity">临界阈值（距长期高点/低点多远以内）</label>
+          <div class="scr-range-row">
+            <input type="range" id="scrProximity" min="1" max="20" step="0.5" value="5" />
+            <span class="scr-range-val" id="scrProximityVal">5.0%</span>
+          </div>
+        </div>
+
+        <div class="scr-field">
+          <label for="scrLookback">长期关键点位回看</label>
+          <div class="scr-lookback-row">
+            <input type="number" id="scrLookback" min="0" max="5000" step="1" value="250" />
+            <span class="scr-unit">交易日</span>
+          </div>
+          <div class="scr-presets" id="scrLookbackPresets">
+            <button type="button" class="scr-preset" data-bars="120">半年</button>
+            <button type="button" class="scr-preset active" data-bars="250">1年</button>
+            <button type="button" class="scr-preset" data-bars="500">2年</button>
+            <button type="button" class="scr-preset" data-bars="750">3年</button>
+            <button type="button" class="scr-preset" data-bars="0">全部</button>
+          </div>
+          <small class="scr-hint">可填任意交易日数，0 = 全部历史</small>
+        </div>
+
+        <div class="scr-field">
+          <label for="scrDirection">方向</label>
+          <select id="scrDirection">
+            <option value="all">全部方向</option>
+            <option value="long">只找多头（逼近前高）</option>
+            <option value="short">只找空头（逼近前低）</option>
+          </select>
+        </div>
+
+        <div class="scr-field">
+          <label for="scrMinScore">最低评分</label>
+          <input type="number" id="scrMinScore" min="0" max="100" step="5" value="0" />
+        </div>
+
+        <div class="scr-field scr-field-wide">
+          <label>参考区间（可选）：按具体日期段取高/低点</label>
+          <div class="scr-date-row">
+            <input type="date" id="scrRefStart" />
+            <span class="scr-tilde">~</span>
+            <input type="date" id="scrRefEnd" />
+            <button class="btn btn-outline btn-sm" id="scrClearRef" type="button">清除</button>
+          </div>
+          <small class="scr-hint">
+            例：2026-06-01 ~ 2026-06-30 就是「用 6 月的最高/最低点作为关键点位」。
+            填了区间就忽略上面的回看交易日数。
+          </small>
+        </div>
+
+        <div class="scr-field scr-field-wide">
+          <label>交易所</label>
+          <div class="scr-checks" id="scrExchanges"></div>
+        </div>
+
+        <div class="scr-field">
+          <label>筛选范围</label>
+          <div class="scr-checks">
+            <label class="scr-check"><input type="checkbox" id="scrMyOnly" /> 只看我交易过的品种</label>
+            <label class="scr-check"><input type="checkbox" id="scrRequireLevel" checked /> 必须落在阈值内</label>
+          </div>
+        </div>
+
+        <div class="scr-actions">
+          <button class="btn btn-primary" id="scrRunBtn" type="button">🔍 开始筛选</button>
+          <button class="btn btn-outline btn-sm" id="scrRefreshBtn" type="button">🔄 刷新行情</button>
+        </div>
+      </div>
+
+      <!-- 结果统计 -->
+      <div class="scr-stats" id="scrStats"></div>
+
+      <!-- 结果表格 -->
+      <section class="section">
+        <div class="section-title scr-title-row">
+          <span>筛选结果 <span class="scr-count" id="scrCount"></span></span>
+          <span class="scr-data-note" id="scrNote"></span>
+        </div>
+        <div class="table-wrap scr-table-wrap">
+          <table class="scr-table">
+            <thead>
+              <tr>
+                <th>品种</th><th>交易所</th><th class="num">最新价</th><th class="num">涨跌</th>
+                <th>信号</th><th class="num">关键位</th><th class="num">距点位</th>
+                <th class="num" title="当前价在长期高低区间中的百分位">区间位置</th>
+                <th>均线</th><th>MACD</th><th>布林带</th>
+                <th class="num">量比</th><th class="num">RSI</th>
+                <th class="num">评分</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="scrTbody">
+              <tr><td colspan="15" class="scr-empty">尚未执行筛选，点击「开始筛选」</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 自选列表 -->
+      <section class="section">
+        <div class="section-title scr-title-row">
+          <span>⭐ 我的自选 <span class="scr-count" id="scrWatchCount"></span></span>
+          <span class="scr-data-note">点行内「+ 自选」即可加入；数据保存在本地 watchlist.json</span>
+        </div>
+        <div class="scr-watchlist" id="scrWatchlist">
+          <div class="scr-empty">暂无自选品种</div>
+        </div>
+      </section>
+
+    </div>
 
     <!-- Symbol Detail Modal (hidden by default) -->
     <div class="modal-overlay" id="symbolModal" style="display:none;">
@@ -315,9 +488,42 @@
       </div>
     </div>
 
+    <!-- ===== Screener Detail Modal ===== -->
+    <div class="modal-overlay" id="scrModal" style="display:none;">
+      <div class="modal modal-lg scr-modal">
+        <div class="modal-header">
+          <h2 id="scrModalTitle">品种详情</h2>
+          <div class="scr-modal-actions">
+            <button class="btn btn-outline btn-sm" id="scrModalWatch" type="button">⭐ 加自选</button>
+            <button class="btn btn-outline modal-close" onclick="closeScreenerModal()">✕ 关闭</button>
+          </div>
+        </div>
+
+        <div class="scr-modal-body">
+          <div class="overview-grid modal-stats" id="scrModalStats"></div>
+
+          <div class="scr-block">
+            <div class="scr-block-title">评分构成</div>
+            <div class="scr-score-bars" id="scrScoreBars"></div>
+          </div>
+
+          <div class="scr-block">
+            <div class="scr-block-title">选中理由</div>
+            <div class="scr-reasons" id="scrReasons"></div>
+          </div>
+
+          <div class="scr-block">
+            <div class="scr-block-title">行情走势（最近 320 个交易日，含关键点位线）</div>
+            <div id="scrChart" class="scr-chart"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </main>
 
   <script src="/static/review.js"></script>
+  <script src="/static/screener.js"></script>
   <script>
     // 快捷日期按钮绑定
     document.querySelectorAll('.btn-quick').forEach(btn => {

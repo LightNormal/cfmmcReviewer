@@ -52,6 +52,73 @@ function shortDate(d) {
 }
 
 // ============================================================
+// 主题（亮色 / 暗色）
+// ============================================================
+// 说明：页面配色全部走 CSS 变量，切换 data-theme 即可；
+// 但 ECharts 的坐标轴/提示框颜色是写在 option 里的（画在 canvas 上），
+// 不随 CSS 变，所以主题切换后必须用新配色重绘图表。
+const THEME_KEY = 'cfmmc-theme';
+
+function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+
+/** 从当前主题的 CSS 变量里取图表要用的颜色 */
+function chartTheme() {
+    const cs = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => (cs.getPropertyValue(name) || '').trim() || fallback;
+    const light = currentTheme() === 'light';
+    return {
+        text: v('--text-dim', light ? '#475569' : '#94a3b8'),
+        textStrong: v('--text', light ? '#0f172a' : '#e2e8f0'),
+        axis: v('--chart-axis', light ? '#cbd5e1' : '#334155'),
+        split: v('--chart-split', light ? 'rgba(148,163,184,.35)' : 'rgba(51,65,85,.55)'),
+        muted: v('--chart-muted', light ? '#94a3b8' : '#64748b'),
+        tooltipBg: v('--chart-tooltip-bg', light ? 'rgba(255,255,255,.98)' : 'rgba(15,23,42,.95)'),
+        tooltipBorder: v('--chart-tooltip-border', light ? '#cbd5e1' : '#334155'),
+        // 序列主色（两种主题通用，亮色下略微加深以保证对比度）
+        blue: light ? '#2563eb' : '#3b82f6',
+        green: light ? '#16a34a' : '#22c55e',
+        red: light ? '#dc2626' : '#ef4444',
+        orange: light ? '#d97706' : '#f59e0b',
+        purple: light ? '#7c3aed' : '#a855f7',
+    };
+}
+
+function updateThemeButton(theme) {
+    const icon = document.getElementById('themeIcon');
+    const label = document.getElementById('themeLabel');
+    const btn = document.getElementById('themeBtn');
+    if (icon) icon.textContent = theme === 'light' ? '☀️' : '🌙';
+    if (label) label.textContent = theme === 'light' ? '亮色' : '暗色';
+    if (btn) btn.title = theme === 'light' ? '当前亮色，点击切换到暗色' : '当前暗色，点击切换到亮色';
+}
+
+function applyTheme(theme, persist) {
+    const t = theme === 'light' ? 'light' : 'dark';
+    if (t === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+    } else {
+        document.documentElement.removeAttribute('data-theme');
+    }
+    if (persist) {
+        try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 隐私模式忽略 */ }
+    }
+    updateThemeButton(t);
+    // 主题变了，图表要按新配色重绘
+    redrawChartsForTheme();
+}
+
+function toggleTheme() {
+    applyTheme(currentTheme() === 'light' ? 'dark' : 'light', true);
+}
+
+function redrawChartsForTheme() {
+    try { if (typeof redrawReviewCharts === 'function') redrawReviewCharts(); } catch (e) { /* ignore */ }
+    try { if (typeof redrawScreenerChart === 'function') redrawScreenerChart(); } catch (e) { /* ignore */ }
+}
+
+// ============================================================
 // 进度遮罩控制
 // ============================================================
 
@@ -164,10 +231,7 @@ function updateLoginUI(status) {
     } else {
         loginBtn.style.display = 'inline-flex';
         logoutBtn.style.display = 'none';
-        // 未登录时不清空账号信息（保留 config.json 中读取的账号显示）
-        if (!_isLoggedIn) {
-            // 保持已有的账号信息不变
-        }
+        // 未登录时不清空账号信息（保留 config.json / 环境变量中读取的账号显示）
         _isLoggedIn = false;
     }
 }
@@ -336,6 +400,30 @@ document.addEventListener('click', e => {
 });
 
 // ============================================================
+// 重载数据（下载完新结算单后不用重启服务）
+// ============================================================
+
+async function reloadData() {
+    const btn = document.getElementById('reloadBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 重载中...'; }
+    try {
+        const res = await fetch(API + '/api/reload', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        const r = data.date_range || {};
+        setStatus('ready', `已重载 ${data.total_days} 个交易日 (${r.start || '-'} ~ ${r.end || '-'})`);
+        // 重新填充日期范围并自动查询一次
+        await initDates();
+    } catch (e) {
+        console.error('重载失败:', e);
+        setStatus('error', '重载失败');
+        alert('重载失败：' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 重载数据'; }
+    }
+}
+
+// ============================================================
 // 初始化：检查登录状态 + 获取日期范围
 // ============================================================
 
@@ -453,16 +541,17 @@ async function doQuery() {
         const data = await apiGet(`/api/query?start=${start}&end=${end}`);
 
         // Step 1 完成
-        let promptLoginAfterRender = false;
-        if (data.missing_count > 0) {
-            if (data.did_auto_download) {
-                completeStep(1, `⬇ 已自动下载，仍缺 ${data.missing_count}天`);
-            } else {
-                completeStep(1, `⚠ ${data.missing_count}天缺失`);
-            }
-            // 后端提示需要登录才能补下载：不再中止渲染，
-            // 先把已有数据完整展示，渲染后再询问是否登录补下
-            if (data.need_login) promptLoginAfterRender = true;
+        // 「缺失」可能包含三类：真缺口 / 早于已有数据 / 晚于已有数据。
+        // 这里只报最需要关注的真实缺口，明细交给下方的缺口诊断面板。
+        const md = data.missing_detail || {};
+        const gaps = (md.gaps || []).length;
+        const pending = (data.need_download_count || 0);
+        if (gaps > 0) {
+            completeStep(1, data.did_auto_download
+                ? `⬇ 已尝试补下载，仍有真实缺口 ${gaps} 天`
+                : `⚠ 真实缺口 ${gaps} 天`);
+        } else if (pending > 0) {
+            completeStep(1, `✓ 无中间缺口，待补新交易日 ${pending} 天`);
         } else {
             completeStep(1, '✓ 数据完整');
         }
@@ -471,6 +560,8 @@ async function doQuery() {
         activateStep(2);
         updateProgress(50, '正在分析交易数据...');
 
+        // 保存一份供「展开/收起」时重绘缺口面板
+        window._lastQueryData = data;
         renderAll(data);
 
         updateProgress(70, '正在渲染结果...');
@@ -487,19 +578,18 @@ async function doQuery() {
 
         setTimeout(() => {
             hideProgress();
-            setStatus('ready', `查询完成 · ${data.overview['交易日数']} 个交易日` +
-                (data.missing_count > 0 ? `（${data.missing_count} 天缺失）` : ''));
-            document.getElementById('queryInfo').textContent = data.overview['查询范围'] || `${start} ~ ${end}`;
-
-            // 数据已完整渲染后再提示登录补下缺失日
-            if (promptLoginAfterRender) {
-                const confirmLogin = confirm(
-                    `已展示现有数据，但发现 ${data.missing_count} 个交易日缺失，\n` +
-                    `需要登录监控中心才能自动下载补全。\n\n` +
-                    `是否立即登录？`
-                );
-                if (confirmLogin) handleLoginClick();
+            const nd = (data.need_download_count || 0);
+            const gaps = ((data.missing_detail || {}).gaps || []).length;
+            let statusText = `查询完成 · ${data.overview['交易日数']} 个交易日`;
+            if (gaps > 0) {
+                statusText += `（真实缺口 ${gaps} 天）`;
+            } else if (nd > 0) {
+                statusText += `（${nd} 天待补）`;
             }
+            setStatus('ready', statusText);
+            document.getElementById('queryInfo').textContent = data.overview['查询范围'] || `${start} ~ ${end}`;
+            // 不再弹原生 confirm：缺口明细已在上方面板里分类展示，
+            // 需要补下载时面板里有明确按钮，避免"只报一个数字"的困惑。
         }, 600);
 
     } catch (e) {
@@ -522,9 +612,224 @@ async function doQuery() {
 
 function renderAll(data) {
     renderOverview(data.overview);
+    renderWarnings(data);
+    renderGapPanel(data);
     renderSymbolTable(data.symbol_summary);
     renderTopTrades(data.trades_sorted);
     renderTopOptTrades(data.opt_top_wins, data.opt_top_losses);
+}
+
+// ---- 数据缺口诊断面板 ----
+let _gapExpanded = false;
+
+function _dateChips(list, maxShown) {
+    if (!list || !list.length) return '<span class="gap-none">无</span>';
+    const shown = _gapExpanded ? list : list.slice(0, maxShown);
+    let html = shown.map(d => `<span class="gap-chip">${escHtml(d)}</span>`).join('');
+    if (!_gapExpanded && list.length > maxShown) {
+        html += `<span class="gap-more">… 还有 ${list.length - maxShown} 天</span>`;
+    }
+    return html;
+}
+
+/**
+ * 把「区间内没有结算单的交易日」分成三类展示。
+ *
+ * 只弹一个 "缺 24 天" 无法判断到底是真缺、还是账户开立前的日期、
+ * 还是节假日（本来就没有）。这里逐类说明，并单独列出区间内的休市日，
+ * 让用户一眼确认节假日确实被正确排除了。
+ */
+function renderGapPanel(data) {
+    const panel = document.getElementById('gapPanel');
+    if (!panel) return;
+
+    const d = data.missing_detail;
+    if (!d) { panel.style.display = 'none'; return; }
+
+    const gaps = d.gaps || [];
+    const before = d.before_range || [];
+    const after = d.after_range || [];
+    const unexplained = d.unexplained || [];
+    const holidays = d.holidays || [];
+    const totalMissing = (data.missing_count || 0);
+    const candidates = (d.download_candidates || []);
+
+    // 没有任何缺口也没有节假日信息 → 隐藏面板
+    if (!totalMissing && !holidays.length) {
+        panel.style.display = 'none';
+        return;
+    }
+
+    const rows = [];
+
+    rows.push(`<div class="gap-summary">
+        区间 <b>${escHtml(d.start)} ~ ${escHtml(d.end)}</b>：
+        交易日 <b>${d.trading_days}</b> 天，已有数据 <b>${d.with_data}</b> 天，
+        缺失 <b class="${totalMissing ? 'gap-warn' : ''}">${totalMissing}</b> 天；
+        区间内休市（节假日）<b>${d.holiday_days}</b> 天，周末 ${d.weekend_days} 天
+        ${d.calendar_ok
+            ? '· 已启用法定节假日日历'
+            : '· <span class="gap-warn">未安装 chinesecalendar，节假日未校验</span>'}
+    </div>`);
+
+    rows.push(`<div class="gap-row">
+        <div class="gap-label gap-label-bad">真实缺口 ${gaps.length} 天
+            <small>夹在已有数据之间，最该关注</small></div>
+        <div class="gap-chips">${_dateChips(gaps, 20)}</div>
+    </div>`);
+
+    rows.push(`<div class="gap-row">
+        <div class="gap-label">早于已有数据 ${before.length} 天
+            <small>本地最早 ${escHtml(d.first_data || '-')}，之前多为账户开立前，补不到</small></div>
+        <div class="gap-chips">${_dateChips(before, 12)}</div>
+    </div>`);
+
+    rows.push(`<div class="gap-row">
+        <div class="gap-label">晚于已有数据 ${after.length} 天
+            <small>本地最新 ${escHtml(d.last_data || '-')}，属于新交易日，可补</small></div>
+        <div class="gap-chips">${_dateChips(after, 12)}</div>
+    </div>`);
+
+    if (unexplained.length) {
+        rows.push(`<div class="gap-row">
+            <div class="gap-label">未分类 ${unexplained.length} 天
+                <small>本地完全没有任何数据</small></div>
+            <div class="gap-chips">${_dateChips(unexplained, 12)}</div>
+        </div>`);
+    }
+
+    rows.push(`<div class="gap-row">
+        <div class="gap-label gap-label-ok">区间内休市 ${holidays.length} 天
+            <small>节假日，本来就不该有结算单，已正确排除</small></div>
+        <div class="gap-chips">${_dateChips(holidays, 20)}</div>
+    </div>`);
+
+    const body = document.getElementById('gapBody');
+    if (body) body.innerHTML = rows.join('');
+
+    // 「值得补」= 真缺口 + 新交易日；为 0 就不必打扰用户
+    const btn = document.getElementById('gapDownloadBtn');
+    if (btn) {
+        btn.style.display = candidates.length ? 'inline-flex' : 'none';
+        btn.textContent = `登录补下载 ${candidates.length} 天`;
+    }
+
+    const toggle = document.getElementById('gapToggleBtn');
+    if (toggle) {
+        toggle.style.display = (gaps.length > 20 || before.length > 12
+            || after.length > 12 || holidays.length > 20) ? 'inline-flex' : 'none';
+        toggle.textContent = _gapExpanded ? '收起日期' : '展开全部日期';
+    }
+
+    panel.style.display = 'block';
+}
+
+function initGapPanelEvents() {
+    const toggle = document.getElementById('gapToggleBtn');
+    if (toggle) {
+        toggle.addEventListener('click', () => {
+            _gapExpanded = !_gapExpanded;
+            if (window._lastQueryData) renderGapPanel(window._lastQueryData);
+        });
+    }
+    const close = document.getElementById('gapCloseBtn');
+    if (close) {
+        close.addEventListener('click', () => {
+            const p = document.getElementById('gapPanel');
+            if (p) p.style.display = 'none';
+        });
+    }
+    const dl = document.getElementById('gapDownloadBtn');
+    if (dl) {
+        dl.addEventListener('click', () => {
+            if (!_isLoggedIn) { handleLoginClick(); return; }
+            // 已登录：带着 auto_download 重新查询一次
+            doQuery();
+        });
+    }
+}
+
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * 数据质量提示横幅。
+ *
+ * 这几类问题必须让用户看见，否则盈亏会被悄悄算错：
+ *   1. 期权合约乘数无法确定（新品种未收录且结算单没有权利金总额）
+ *      —— 原油这类品种按 1.0 计算会把盈亏缩小 1000 倍
+ *   2. 期权到期作废被强制结算 —— 虚值到期不产生成交行，需要让用户核对
+ *   3. 期末仍有未平仓期权 —— 已实现盈亏不含其浮动盈亏
+ */
+function renderWarnings(data) {
+    const el = document.getElementById('dataWarnings');
+    if (!el) return;
+
+    const items = [];
+    (data.multiplier_warnings || []).forEach(w => items.push(escHtml(w)));
+
+    // 到期作废：虚值到期不会产生成交行，系统按到期日以 0 价格强制平仓
+    const expiries = data.expiry_settlements || [];
+    if (expiries.length) {
+        const detail = expiries.slice(0, 5).map(e => {
+            const sign = (e.pnl || 0) >= 0 ? '+' : '';
+            return `${escHtml(e.contract)}（${escHtml(e.side)} ${e.volume} 手，`
+                + `${sign}${fmtNum(e.pnl)} 元${e.date_is_approximate ? '，日期近似' : ''}）`;
+        }).join('、');
+        items.push(`已按「到期作废」结算 ${expiries.length} 个期权合约：${detail}`
+            + `${expiries.length > 5 ? ' 等' : ''}。`
+            + '虚值到期不会产生平仓成交行，系统按到期日以 0 价格平仓计入已实现盈亏；'
+            + '若其中有实值行权，请核对结算单');
+    }
+
+    const openPos = data.opt_open_positions || {};
+    // 解析布局提示：表头认不出来会回退固定列，可能算错，必须提示
+    (data.layout_notes || []).forEach(w => items.push(escHtml(w)));
+    // 到期日规则未收录 → 没做结算，需要提醒人工核对
+    (data.expiry_unknown || []).forEach(w => items.push(escHtml(w)));
+
+    // 方向无法识别（行权/履约）的期权行：这些行的盈亏确实没有被计算。
+    // 必须聚合展示 —— 实测一次可能上百条，逐条列会把页面刷爆。
+    const unparsed = data.unparsed_option_rows || [];
+    if (unparsed.length) {
+        unparsed.slice(0, 5).forEach(row => {
+            items.push(`${escHtml(row.contract)} 在 ${escHtml(row.date)} 有 `
+                + `${row.volume} 手方向为「${escHtml(row.direction)}」的记录，`
+                + '未计入盈亏');
+        });
+        if (unparsed.length > 5) {
+            items.push(`…另有 ${unparsed.length - 5} 条方向无法识别的期权记录`
+                + `（共 ${unparsed.length} 条，这些行的盈亏均未计入）`);
+        }
+    }
+    const openItems = Object.entries(openPos)
+        .filter(([, v]) => v && ((v.long || 0) > 0 || (v.short || 0) > 0));
+    if (openItems.length) {
+        const detail = openItems.slice(0, 5)
+            .map(([k, v]) => `${escHtml(k)} 多${v.long}手/空${v.short}手`)
+            .join('、');
+        items.push(`期末仍有 ${openItems.length} 个期权合约未平仓（${detail}${openItems.length > 5 ? ' 等' : ''}），`
+            + '已实现盈亏不包含这些持仓的浮动盈亏');
+    }
+
+    if (!items.length) {
+        el.style.display = 'none';
+        el.innerHTML = '';
+        return;
+    }
+    // 兜底截断：任何一类提示过多都不该把整页刷爆
+    const MAX_ITEMS = 8;
+    let shown = items;
+    let tail = '';
+    if (items.length > MAX_ITEMS) {
+        shown = items.slice(0, MAX_ITEMS);
+        tail = `<li class="warn-more">…另有 ${items.length - MAX_ITEMS} 条提示未显示</li>`;
+    }
+    el.style.display = 'block';
+    el.innerHTML = `<div class="warn-title">⚠ 数据质量提示（${items.length}）</div>
+        <ul>${shown.map(x => `<li>${x}</li>`).join('')}${tail}</ul>`;
 }
 
 function renderOverview(ov) {
@@ -594,9 +899,18 @@ function renderSymbolTable(rows) {
 
 // ---- TOP Trades ----
 function renderTopTrades(trades) {
-    if (!trades || trades.length === 0) return;
-
     const winsBody = document.getElementById('topWinsBody');
+    const lossesBody = document.getElementById('topLossesBody');
+
+    // 空结果必须清空表格，否则会残留上一次查询的 TOP 数据，
+    // 与已更新的总览卡片形成"张冠李戴"的错配。
+    if (!trades || trades.length === 0) {
+        const emptyRow = '<tr><td colspan="8" class="empty-state">暂无成交记录</td></tr>';
+        if (winsBody) winsBody.innerHTML = emptyRow;
+        if (lossesBody) lossesBody.innerHTML = emptyRow;
+        return;
+    }
+
     winsBody.innerHTML = trades.slice(0, 10).map(t => {
         const pnlCls = t.realized_pnl > 0 ? 'positive' : t.realized_pnl < 0 ? 'negative' : '';
         const pnlText = (t.realized_pnl >= 0 ? '+' : '') + fmtNum(t.realized_pnl);
@@ -612,7 +926,6 @@ function renderTopTrades(trades) {
         </tr>`;
     }).join('');
 
-    const lossesBody = document.getElementById('topLossesBody');
     lossesBody.innerHTML = trades.slice(-10).reverse().map(t => {
         const pnlCls = t.realized_pnl > 0 ? 'positive' : t.realized_pnl < 0 ? 'negative' : '';
         const pnlText = (t.realized_pnl >= 0 ? '+' : '') + fmtNum(t.realized_pnl);
@@ -634,7 +947,7 @@ function renderTopOptTrades(optWins, optLosses) {
     // 优先取 FIFO 已实现盈亏 realized_pnl；旧接口只有 pnl 时回退
     const optPnlOf = o => (typeof o.realized_pnl === 'number' ? o.realized_pnl : (o.pnl || 0));
 
-    const renderRows = (rows, lossMode) => rows.map(o => {
+    const renderRows = rows => rows.map(o => {
         const pnl = optPnlOf(o);
         const pnlCls = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
         const pnlText = (pnl >= 0 ? '+' : '') + fmtNum(pnl);
@@ -654,79 +967,14 @@ function renderTopOptTrades(optWins, optLosses) {
     // TOP 10 期权盈利
     const winsBody = document.getElementById('topOptWinsBody');
     winsBody.innerHTML = (optWins && optWins.length)
-        ? renderRows(optWins, false)
+        ? renderRows(optWins)
         : '<tr><td colspan="9" class="empty-state"><p>暂无期权平仓盈利</p></td></tr>';
 
     // TOP 10 期权亏损
     const lossesBody = document.getElementById('topOptLossesBody');
     lossesBody.innerHTML = (optLosses && optLosses.length)
-        ? renderRows(optLosses, true)
+        ? renderRows(optLosses)
         : '<tr><td colspan="9" class="empty-state"><p>暂无期权平仓亏损</p></td></tr>';
-}
-
-// ---- 盈亏纵览表格（替代原来的柱状图）----
-function renderPnlOverview(rows) {
-    const tbody = document.getElementById('pnlOverviewBody');
-    if (!rows || rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><p>暂无数据，请先查询</p></td></tr>';
-        return;
-    }
-
-    // 按总盈亏排序
-    const sorted = [...rows].sort((a, b) => (b['总盈亏(元)'] || 0) - (a['总盈亏(元)'] || 0));
-
-    // 计算汇总
-    let totalFuturesPnl = 0, totalFuturesComm = 0, totalOptPnl = 0, totalOptComm = 0, totalAllPnl = 0, totalAllComm = 0;
-    sorted.forEach(r => {
-        totalFuturesPnl += (r['期货盈亏(元)'] || 0);
-        totalFuturesComm += (r['期货手续费(元)'] || 0);
-        totalOptPnl += (r['期权盈亏(元)'] || 0);
-        totalOptComm += (r['期权手续费(元)'] || 0);
-        totalAllPnl += (r['总盈亏(元)'] || 0);
-        totalAllComm += (r['总手续费(元)'] || 0);
-    });
-
-    tbody.innerHTML = sorted.map((r, idx) => {
-        const fp = r['期货盈亏(元)'];
-        const op = r['期权盈亏(元)'];
-        const tp = r['总盈亏(元)'];
-        const fpCls = fp > 0 ? 'positive' : fp < 0 ? 'negative' : '';
-        const opCls = op > 0 ? 'positive' : op < 0 ? 'negative' : '';
-        const tpCls = tp > 0 ? 'positive' : tp < 0 ? 'negative' : '';
-
-        let rankBadge = `<span class="rank-num">${idx + 1}</span>`;
-        if (idx === 0 && tp > 0) rankBadge = '<span class="rank-num rank-gold">🥇</span>';
-        else if (idx === 1 && tp > 0) rankBadge = '<span class="rank-num rank-silver">🥈</span>';
-        else if (idx === 2 && tp > 0) rankBadge = '<span class="rank-num rank-bronze">🥉</span>';
-
-        return `<tr class="clickable" onclick="showSymbolDetail('${r['品种']}')">
-            <td style="text-align:center">${rankBadge}</td>
-            <td style="font-weight:700">${r['品种']}</td>
-            <td>${r['手数']}</td>
-            <td class="${fpCls}">${(fp >= 0 ? '+' : '') + fmtNum(fp)}</td>
-            <td>${fmtNum(r['期货手续费(元)'])}</td>
-            <td class="${opCls}">${(op >= 0 ? '+' : '') + fmtNum(op)}</td>
-            <td>${fmtNum(r['期权手续费(元)'])}</td>
-            <td class="${tpCls}" style="font-weight:600">${(tp >= 0 ? '+' : '') + fmtNum(tp)}</td>
-            <td>${fmtNum(r['总手续费(元)'])}</td>
-            <td>${r['胜率'] || '-'}</td>
-            <td>${r['盈亏比'] || '-'}</td>
-        </tr>`;
-    }).join('');
-
-    // 汇总行
-    const totalCls = totalAllPnl >= 0 ? 'positive' : 'negative';
-    const summaryRow = document.createElement('tr');
-    summaryRow.className = 'summary-row';
-    summaryRow.innerHTML = `
-        <td colspan="3" style="text-align:right;font-weight:700;">合计 (${sorted.length} 个品种)</td>
-        <td class="${totalFuturesPnl >= 0 ? 'positive' : 'negative'}">${(totalFuturesPnl >= 0 ? '+' : '') + fmtNum(totalFuturesPnl)}</td>
-        <td>${fmtNum(totalFuturesComm)}</td>
-        <td class="${totalOptPnl >= 0 ? 'positive' : 'negative'}">${(totalOptPnl >= 0 ? '+' : '') + fmtNum(totalOptPnl)}</td>
-        <td>${fmtNum(totalOptComm)}</td>
-        <td class="${totalCls}" style="font-weight:700">${(totalAllPnl >= 0 ? '+' : '') + fmtNum(totalAllPnl)}</td>
-        <td>${fmtNum(totalAllComm)}</td>`;
-    tbody.appendChild(summaryRow);
 }
 
 // ============================================================
@@ -740,11 +988,175 @@ async function loadCharts(start, end) {
         if (data.error) return;
 
         if (data.daily_trend) renderTrendChart(data.daily_trend);
+        renderEquityChart(data.equity, data.equity_stats);
 
         updateProgress(98, '图表渲染完成');
     } catch (e) {
         console.warn('图表数据加载失败:', e);
     }
+}
+
+// ---- 账户权益曲线 ----
+let _equityChart = null;
+let _equityResizeBound = false;
+let _lastEquity = null;      // { rows, stats } —— 供主题切换重绘
+let _lastTrend = null;       // 每日趋势数据 —— 供主题切换重绘
+
+/** 主题切换后，用缓存的同一份数据以新配色重绘两张图 */
+function redrawReviewCharts() {
+    if (_lastTrend) {
+        try { renderTrendChart(_lastTrend); } catch (e) { /* ignore */ }
+    }
+    if (_lastEquity) {
+        try { renderEquityChart(_lastEquity.rows, _lastEquity.stats); } catch (e) { /* ignore */ }
+    }
+}
+
+/**
+ * 权益曲线：客户权益 + 当日结存（左轴）、保证金占用（右轴）。
+ *
+ * 数据来自结算单的「资金状况」区。之前这块解析了却从未展示，
+ * 导致复盘只能看"赚了多少"，看不到"账户怎么走过来的"（含回撤）。
+ */
+function renderEquityChart(rows, stats) {
+    const T = chartTheme();
+    // 缓存一份，切换主题时用新配色重绘（图表颜色不在 CSS 里）
+    _lastEquity = { rows: rows, stats: stats };
+    const dom = document.getElementById('chartEquity');
+    if (!dom) return;
+
+    if (!rows || !rows.length) {
+        dom.innerHTML = '<div class="empty-state"><p>该区间没有资金状况数据</p></div>';
+        _setEquityStats(null);
+        return;
+    }
+    if (typeof echarts === 'undefined') {
+        dom.innerHTML = '<div class="empty-state"><p>ECharts 未加载（请检查网络能否访问 CDN）</p></div>';
+        return;
+    }
+
+    dom.innerHTML = '';
+    if (_equityChart && !_equityChart.isDisposed()) _equityChart.dispose();
+
+    _equityChart = echarts.init(dom, null, { renderer: 'canvas' });
+
+    const dates = rows.map(r => String(r.date || '').slice(5));   // MM-DD
+    const equity = rows.map(r => r.equity);
+    const deposit = rows.map(r => r.deposit);
+    const margin = rows.map(r => r.margin);
+    const available = rows.map(r => r.available);
+
+    // 起点定为区间首日，让"涨了多少"一眼可见
+    const base = equity.length ? equity[0] : 0;
+
+    _equityChart.setOption({
+        animation: false,
+        backgroundColor: 'transparent',
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            backgroundColor: T.tooltipBg,
+            borderColor: T.tooltipBorder,
+            textStyle: { color: T.textStrong, fontSize: 12 },
+            valueFormatter: (v) => (v === null || v === undefined) ? '-' : fmtNum(v),
+        },
+        legend: {
+            top: 0, textStyle: { color: T.text, fontSize: 11 },
+            data: ['客户权益', '当日结存', '保证金占用', '可用资金'],
+        },
+        grid: { left: 76, right: 76, top: 34, bottom: 66 },
+        xAxis: {
+            type: 'category', data: dates, boundaryGap: false,
+            axisLine: { lineStyle: { color: T.axis } },
+            axisLabel: { color: T.text, fontSize: 10 },
+        },
+        yAxis: [
+            {
+                type: 'value', scale: true, name: '权益(元)',
+                nameTextStyle: { color: T.text, fontSize: 10 },
+                splitLine: { lineStyle: { color: T.split } },
+                axisLabel: { color: T.text, fontSize: 10, formatter: v => fmtNum(v, 0) },
+            },
+            {
+                type: 'value', scale: true, name: '保证金(元)',
+                nameTextStyle: { color: T.text, fontSize: 10 },
+                splitLine: { show: false },
+                axisLabel: { color: T.text, fontSize: 10, formatter: v => fmtNum(v, 0) },
+            },
+        ],
+        dataZoom: [
+            { type: 'inside', start: 0, end: 100 },
+            { type: 'slider', bottom: 8, height: 16, start: 0, end: 100,
+              textStyle: { color: T.text, fontSize: 10 } },
+        ],
+        series: [
+            {
+                name: '客户权益', type: 'line', data: equity,
+                symbol: 'none', smooth: true,
+                lineStyle: { width: 2, color: '#3b82f6' },
+                itemStyle: { color: '#3b82f6' },
+                areaStyle: {
+                    color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                        { offset: 0, color: 'rgba(59,130,246,.35)' },
+                        { offset: 1, color: 'rgba(59,130,246,.02)' },
+                    ]),
+                },
+                // 首日基准线：直观看出区间内权益是涨是跌
+                markLine: base ? {
+                    symbol: 'none', silent: true,
+                    data: [{
+                        yAxis: base,
+                        lineStyle: { color: T.muted, type: 'dashed', width: 1 },
+                        label: { formatter: '起始 ' + fmtNum(base, 0),
+                                 color: T.text, position: 'insideEndTop', fontSize: 10 },
+                    }],
+                } : undefined,
+            },
+            {
+                name: '当日结存', type: 'line', data: deposit, symbol: 'none',
+                lineStyle: { width: 1.2, type: 'dashed', color: '#a855f7' },
+                itemStyle: { color: '#a855f7' },
+            },
+            {
+                name: '保证金占用', type: 'line', yAxisIndex: 1, data: margin,
+                symbol: 'none', smooth: true,
+                lineStyle: { width: 1.2, color: '#f59e0b' },
+                itemStyle: { color: '#f59e0b' },
+            },
+            {
+                name: '可用资金', type: 'line', yAxisIndex: 1, data: available,
+                symbol: 'none',
+                lineStyle: { width: 1, type: 'dotted', color: '#22c55e' },
+                itemStyle: { color: '#22c55e' },
+            },
+        ],
+    });
+
+    _setEquityStats(stats);
+
+    if (!_equityResizeBound) {
+        _equityResizeBound = true;
+        window.addEventListener('resize', () => {
+            if (_equityChart && !_equityChart.isDisposed()) _equityChart.resize();
+        });
+    }
+}
+
+function _setEquityStats(stats) {
+    const el = document.getElementById('equityStats');
+    if (!el) return;
+    if (!stats || !stats.last_equity) { el.textContent = ''; return; }
+    const chg = stats.change || 0;
+    const cls = chg > 0 ? 'negative' : chg < 0 ? 'positive' : '';   // 红涨绿跌
+    const sign = chg > 0 ? '+' : '';
+    const dd = stats.max_drawdown_pct;
+    el.innerHTML = `起始 ${fmtNum(stats.first_equity, 0)} → 期末 `
+        + `<b class="${cls}">${fmtNum(stats.last_equity, 0)}</b>`
+        + `（<span class="${cls}">${sign}${fmtNum(chg, 0)}`
+        + `${stats.change_pct === null || stats.change_pct === undefined ? '' : '，' + sign + fmtNum(stats.change_pct) + '%'}</span>）`
+        + (dd === null || dd === undefined ? ''
+            : ` · 最大回撤 <span class="positive">${fmtNum(dd)}%</span>`
+              + (stats.peak_date ? `（${escHtml(stats.peak_date)} → ${escHtml(stats.trough_date)}）` : ''));
 }
 
 // ---- 每日趋势图（横向：X轴日期，Y轴金额）----
@@ -763,6 +1175,9 @@ function ensureTrendChartResize() {
 }
 
 function renderTrendChart(trendData) {
+    const T = chartTheme();
+    // 缓存一份，切换主题时重绘
+    _lastTrend = trendData;
     const dom = document.getElementById('chartTrend');
     if (!dom || !trendData || !trendData.length) return;
 
@@ -793,19 +1208,19 @@ function renderTrendChart(trendData) {
         { type: 'inside', start: startPct, end: 100, zoomOnMouseWheel: true, moveOnMouseMove: true },
         { type: 'slider', start: startPct, end: 100, height: 18, bottom: 10,
           fillerOpacity: 0.25, handleSize: '110%',
-          textStyle: { color: '#aaa', fontSize: 10 } },
+          textStyle: { color: T.text, fontSize: 10 } },
     ] : [];
 
     chart.setOption({
         tooltip: {
             trigger: 'axis',
             axisPointer: { type: 'cross' },
-            backgroundColor: 'rgba(30, 41, 59, 0.95)',
+            backgroundColor: T.tooltipBg,
             borderColor: 'rgba(255,255,255,0.15)',
             borderWidth: 1,
             borderRadius: 6,
             padding: [8, 12],
-            textStyle: { color: '#e2e8f0', fontSize: 13 },
+            textStyle: { color: T.textStrong, fontSize: 13 },
         },
         legend: {
             data: ['每日净盈亏', '累计净盈亏'],
@@ -826,23 +1241,23 @@ function renderTrendChart(trendData) {
             type: 'category',
             data: dates,
             axisLabel: {
-                fontSize: 11, color: '#aaa',
+                fontSize: 11, color: T.text,
                 rotate: n > 20 ? 35 : (n > 10 ? 25 : 0),
                 // 跨年范围显示 YY-MM-DD，否则 MM-DD
                 formatter: v => (n > 0 && new Set(dates.map(d => d.slice(0, 4))).size > 1)
                     ? v.substring(2) : v.substring(5),
             },
-            axisLine: { lineStyle: { color: '#555' } },
+            axisLine: { lineStyle: { color: T.axis } },
             axisTick: { alignWithLabel: true },
         },
         yAxis: {
             type: 'value',
             axisLabel: {
-                fontSize: 11, color: '#aaa',
+                fontSize: 11, color: T.text,
                 formatter: v => (Math.abs(v) >= 10000 ? (v / 10000).toFixed(1) + 'w' : v),
             },
-            axisLine: { lineStyle: { color: '#555' } },
-            splitLine: { lineStyle: { color: '#333' } }
+            axisLine: { lineStyle: { color: T.axis } },
+            splitLine: { lineStyle: { color: T.split } }
         },
         dataZoom: zoomComponents,
         series: [
@@ -884,8 +1299,16 @@ function renderTrendChart(trendData) {
         }
     });
 
-    dom.addEventListener('mousedown', () => { clickHandled = false; });
-    dom.addEventListener('mouseup', function (e) {
+    // 每次重新渲染都要先摘掉上一轮绑定的处理器。
+    // 原实现直接 addEventListener，查询 N 次就会累积 N 个闭包（捕获的是已被
+    // dispose 的旧 chart），点击趋势图时会重复触发并访问已销毁的实例。
+    if (dom._trendHandlers) {
+        dom.removeEventListener('mousedown', dom._trendHandlers.down);
+        dom.removeEventListener('mouseup', dom._trendHandlers.up);
+    }
+
+    const onTrendMouseDown = () => { clickHandled = false; };
+    const onTrendMouseUp = function (e) {
         if (clickHandled) return;
         const rect = dom.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -897,15 +1320,22 @@ function renderTrendChart(trendData) {
         } catch (_) { /* 图表正在重建等场景忽略 */ }
         if (idx === null || idx < 0 || idx >= _trendDates.length) return;
         // 仅当点击确实落在绘图区时响应
-        const opt = chart.getOption();
-        const grid = (opt.grid && opt.grid[0]) || {};
+        let grid = {};
+        try {
+            const opt = chart.getOption();
+            grid = (opt.grid && opt.grid[0]) || {};
+        } catch (_) { return; }   // 旧 chart 已销毁时不响应
         const left = parseFloat(grid.left) || 60;
         const right = parseFloat(grid.right) || 60;
         const top = parseFloat(grid.top) || 55;
         const bottom = parseFloat(grid.bottom) || 60;
         if (x < left || x > rect.width - right || y < top || y > rect.height - bottom) return;
         showDailyDetail(_trendDates[idx]);
-    });
+    };
+
+    dom.addEventListener('mousedown', onTrendMouseDown);
+    dom.addEventListener('mouseup', onTrendMouseUp);
+    dom._trendHandlers = { down: onTrendMouseDown, up: onTrendMouseUp };
 }
 
 
@@ -1298,4 +1728,8 @@ function renderDailyOptions(options) {
 // ============================================================
 // 启动
 // ============================================================
-document.addEventListener('DOMContentLoaded', initDates);
+document.addEventListener('DOMContentLoaded', () => {
+    updateThemeButton(currentTheme());
+    initGapPanelEvents();
+    initDates();
+});

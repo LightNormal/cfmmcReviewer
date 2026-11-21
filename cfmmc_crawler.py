@@ -59,24 +59,37 @@ class CFMMCCrawler(object):
         self._ss = None
         self.token = None
 
-    @staticmethod
-    def _recognize_veri_code(image_bytes: bytes) -> str | None:
-        """
-        使用 PIL 图像预处理（二值化+反色）后保存临时文件供 Tesseract 识别。
-        返回识别结果，失败返回 None。
-        注意: 需要系统安装 tesseract (macOS: brew install tesseract)
-        """
-        try:
-            import subprocess
-            import tempfile
+    _ocr_instance = None      # ddddocr 单例（初始化较慢，复用）
 
+    @staticmethod
+    def _recognize_with_ddddocr(image_bytes: bytes):
+        """用 ddddocr（深度学习 OCR）识别。未安装或失败返回 None。"""
+        try:
+            import ddddocr
+        except ImportError:
+            return None
+        try:
+            if CFMMCCrawler._ocr_instance is None:
+                CFMMCCrawler._ocr_instance = ddddocr.DdddOcr(show_ad=False)
+            text = CFMMCCrawler._ocr_instance.classification(image_bytes)
+            return (text or '').strip() or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _recognize_with_tesseract(image_bytes: bytes):
+        """退路：PIL 预处理后交给 tesseract CLI。未安装或失败返回 None。"""
+        import subprocess
+        import tempfile
+
+        tmp_path = None
+        try:
             im = Image.open(BytesIO(image_bytes))
             im = im.convert('L')
             # 二值化（阈值210）+ 反色，增强对比度
             binary = im.point([0 if i < 210 else 1 for i in range(256)], '1')
             inverted = PIL.ImageOps.invert(binary.convert('L'))
 
-            # 写入临时文件给 tesseract CLI 调用
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 tmp_path = tmp.name
                 inverted.save(tmp_path)
@@ -85,15 +98,30 @@ class CFMMCCrawler(object):
                 ['tesseract', tmp_path, 'stdout', '-l', 'eng', '--psm', '7'],
                 capture_output=True, text=True, timeout=10
             )
-            os.unlink(tmp_path)
-
             code = result.stdout.strip()
             return code if code else None
         except FileNotFoundError:
-            # tesseract 未安装
-            return None
+            return None          # tesseract 未安装
         except Exception:
             return None
+        finally:
+            # 必须放在 finally：subprocess 超时/异常时也要清理，
+            # 否则每次登录重试都会残留一个临时 PNG。
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _recognize_veri_code(image_bytes: bytes) -> str | None:
+        """识别验证码。
+
+        优先 ddddocr（深度学习，准确率更高，也是 README 推荐安装的库）；
+        未安装或识别失败时退回 tesseract CLI。
+        """
+        return (CFMMCCrawler._recognize_with_ddddocr(image_bytes)
+                or CFMMCCrawler._recognize_with_tesseract(image_bytes))
 
     def _get_veri_code(self, verification_code_url: str) -> str:
         """
@@ -102,13 +130,15 @@ class CFMMCCrawler(object):
         img_bytes = self._ss.get(verification_code_url).content
 
         if self.auto_recognize:
-            code = self._recognize_veri_code(img_bytes)
-            if code and len(code) == self.VERI_CODE_LENGTH:
-                code = ''.join(filter(str.isalnum, code))
+            raw = self._recognize_veri_code(img_bytes)
+            # 先过滤非字母数字字符再校验长度：
+            # 原实现先判长度再过滤，OCR 多识别出一个空格就会得到 5 位数字
+            # 却仍被提交，必然"验证码错误"。
+            code = ''.join(ch for ch in (raw or '') if ch.isalnum())
+            if len(code) == self.VERI_CODE_LENGTH:
                 print(f'  自动识别验证码: {code}')
                 return code
-            else:
-                print(f'  自动识别失败(code="{code}"), 切换到手动输入...')
+            print(f'  自动识别失败(raw={raw!r}), 切换到手动输入...')
 
         # 手动输入 fallback
         with Image.open(BytesIO(img_bytes)) as img:
